@@ -890,6 +890,16 @@ public class MainHook implements IXposedHookLoadPackage {
     private static void fixMomentsButtonOverlap(final Activity act) {
         final Handler h = ui();
         if (h == null) return;
+        // 「原图」按钮常在勾选图片之后才出现，单次探测会漏 → 多次重试（幂等：每次先复位再计算）
+        for (int delay : new int[]{450, 1200, 2500, 4500}) {
+            scheduleOverlapFix(act, h, delay);
+        }
+    }
+
+    /** UI 重叠修复的上次结果签名，用于多次重试时去重日志 */
+    private static int sLastOverlapSig = Integer.MIN_VALUE;
+
+    private static void scheduleOverlapFix(final Activity act, Handler h, final int delay) {
         h.postDelayed(new Runnable() {
             @Override
             public void run() {
@@ -907,27 +917,26 @@ public class MainHook implements IXposedHookLoadPackage {
                     int yuanRight = rl[0] + yuan.getWidth();
                     int makeLeft = ml[0];
                     if (yuanRight > makeLeft - gap) {
-                        int shift = yuanRight - (makeLeft - gap);   // 需要左移的像素
+                        int shift = yuanRight - (makeLeft - gap);   // 总共需要拉开的像素
                         int minLeft = dpAct(act, 4);
-                        int allowed = rl[0] - minLeft;              // 最多左移到距屏左 4dp
+                        int allowed = Math.max(0, rl[0] - minLeft); // 最多左移到距屏左 4dp
                         int applied = Math.min(shift, allowed);
-                        if (applied > 0) {
-                            yuan.setTranslationX(-applied);
-                            log("★ [UI] 原图左移 " + applied + "px 以避免与「制作视频」重叠");
-                        } else {
-                            // 原图已贴左，改为把「制作视频」右移
-                            int need = yuanRight - makeLeft + gap;
-                            if (need > 0) {
-                                make.setTranslationX(need);
-                                log("★ [UI] 「制作视频」右移 " + need + "px 以避免与「原图」重叠");
-                            }
+                        int rest = shift - applied;
+                        if (applied > 0) yuan.setTranslationX(-applied);
+                        // 左移空间不足的部分，由「制作视频」右移补足（否则仍会重叠）
+                        if (rest > 0) make.setTranslationX(rest);
+                        // 多次重试会重复计算出同一结果，去重打印避免刷屏
+                        int sig = applied * 100000 + rest;
+                        if (sig != sLastOverlapSig) {
+                            sLastOverlapSig = sig;
+                            log("★ [UI] 修复重叠：原图左移 " + applied + "px，制作视频右移 " + rest + "px");
                         }
                     }
                 } catch (Throwable t) {
                     log("UI 重叠修复失败: " + t);
                 }
             }
-        }, 450);
+        }, delay);
     }
 
     private static TextView findText(View v, String exact) {
