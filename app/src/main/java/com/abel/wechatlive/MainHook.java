@@ -98,6 +98,13 @@ public class MainHook implements IXposedHookLoadPackage {
     // 记录微信正在写入的「基础临时文件」对应的 FileOutputStream 实例（WeakHashMap 避免泄漏）
     private static final Map<Object, String> sFosTemp = new WeakHashMap<Object, String>();
 
+    // ── v7.9 缩放拦截状态（全部限次，避免异常时刷屏/连锁影响）──
+    private static volatile int sScaleLogged = 0;      // createScaledBitmap 探测日志次数
+    private static volatile int sBlocked = 0;          // createScaledBitmap 拦截次数
+    private static volatile int sMatrixBlocked = 0;    // createBitmap(Matrix) 拦截次数
+    private static volatile int sDecodeBlocked = 0;    // BitmapFactory 解码降采样拦截次数
+    private static volatile boolean sLibsDumped = false;
+
     private static String sProc = "?";
     private static long sLastReport = 0L;
     private static int sForceCount = 0;
@@ -134,7 +141,7 @@ public class MainHook implements IXposedHookLoadPackage {
         sProc = lp.processName;
 
         log("========================================");
-        log("WechatLive v7.8 注入成功  proc=" + sProc);
+        log("WechatLive v7.9 注入成功  proc=" + sProc);
 
         // 相册只在主进程，重量级 hook 只装主进程，避免 :push/:appbrand 等无谓开销
         boolean main = Const.WECHAT_PKG.equals(sProc);
@@ -298,6 +305,8 @@ public class MainHook implements IXposedHookLoadPackage {
                                         it.putExtra(K_SHOW_RAW_BTN, true);
                                         log("★ [朋友圈注入] SnsUploadUI Intent 已注入 send_raw_img=true");
                                     }
+                                    // v7.9：此刻微信的图像 native 库已加载，采集一次用于定位编码器
+                                    dumpImageNativeLibs();
                                 }
                             } catch (Throwable ignored) {
                             }
@@ -577,11 +586,11 @@ public class MainHook implements IXposedHookLoadPackage {
      * 仅「朋友圈上传原图」开启时挂载，限次 10，普通缩略图忽略，开关关闭零开销。
      */
     private void installMomentsScaleProbe() {
+        // ① Bitmap.createScaledBitmap —— 探测 + 拦截（命中即短路返回原图，等于取消降采样）
         XC_MethodHook scale = new XC_MethodHook() {
-            private int logged = 0;
             @Override
-            protected void afterHookedMethod(MethodHookParam p) {
-                if (!cMomentsRaw || logged >= 10) return;
+            protected void beforeHookedMethod(MethodHookParam p) {
+                if (!cMomentsRaw) return;
                 try {
                     android.graphics.Bitmap src = (android.graphics.Bitmap) p.args[0];
                     if (src == null || src.isRecycled()) return;
@@ -589,9 +598,23 @@ public class MainHook implements IXposedHookLoadPackage {
                     if (sw * sh < 100000) return;   // 只关心上传级大图降采样
                     int dw = (Integer) p.args[1];
                     int dh = (Integer) p.args[2];
-                    logged++;
-                    log("★ [朋友圈缩放探测] 源=" + sw + "x" + sh
-                            + " -> 目标=" + dw + "x" + dh + "  " + p.method.getName());
+                    boolean shrink = (dw < sw || dh < sh);
+                    if (!shrink) return;
+                    if (!nearSns()) return;             // 廉价前置：不在朋友圈相关界面直接跳过
+                    boolean sns = inSnsStack();
+                    if (sScaleLogged < 12) {
+                        sScaleLogged++;
+                        log("★ [朋友圈缩放探测] 源=" + sw + "x" + sh + " -> 目标=" + dw + "x" + dh
+                                + "  sns=" + sns + "  " + p.method.getName()
+                                + "\n    栈: " + stackBrief());
+                    }
+                    // 仅拦截 sns 上下文下的「上传级大图」降采样：长边 > 2560 说明这是原图在被压
+                    if (sns && Math.max(sw, sh) > 2560 && sBlocked < 24) {
+                        sBlocked++;
+                        p.setResult(src);   // 直接返回原图，取消这次降采样
+                        log("★ [朋友圈拦截] 已阻止降采样 " + sw + "x" + sh + " -> " + dw + "x" + dh
+                                + "（返回原图，第 " + sBlocked + " 次）");
+                    }
                 } catch (Throwable ignored) {
                 }
             }
@@ -599,7 +622,7 @@ public class MainHook implements IXposedHookLoadPackage {
         try {
             XposedHelpers.findAndHookMethod(android.graphics.Bitmap.class, "createScaledBitmap",
                     android.graphics.Bitmap.class, int.class, int.class, boolean.class, scale);
-            log("已挂载 Bitmap.createScaledBitmap 缩放探测");
+            log("已挂载 Bitmap.createScaledBitmap 缩放拦截");
         } catch (Throwable t) {
             log("hook createScaledBitmap 失败: " + t);
         }
@@ -608,10 +631,184 @@ public class MainHook implements IXposedHookLoadPackage {
                     android.graphics.Bitmap.class, int.class, int.class, scale);
             XposedHelpers.findAndHookMethod(android.media.ThumbnailUtils.class, "extractThumbnail",
                     android.graphics.Bitmap.class, int.class, int.class, int.class, scale);
-            log("已挂载 ThumbnailUtils.extractThumbnail 缩放探测");
+            log("已挂载 ThumbnailUtils.extractThumbnail 缩放拦截");
         } catch (Throwable t) {
             log("hook ThumbnailUtils 失败: " + t);
         }
+
+        // ② Bitmap.createBitmap(src, x,y,w,h, Matrix, filter) —— Matrix 缩放路径（createScaledBitmap 的底层，
+        //    也是自研压缩代码最常用的入口）。若 Matrix 是「缩小」且源为上传级大图，则去掉变换。
+        try {
+            XposedHelpers.findAndHookMethod(android.graphics.Bitmap.class, "createBitmap",
+                    android.graphics.Bitmap.class, int.class, int.class, int.class, int.class,
+                    android.graphics.Matrix.class, boolean.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam p) {
+                            if (!cMomentsRaw) return;
+                            try {
+                                android.graphics.Matrix m = (android.graphics.Matrix) p.args[5];
+                                if (m == null) return;
+                                android.graphics.Bitmap src = (android.graphics.Bitmap) p.args[0];
+                                if (src == null || src.isRecycled()) return;
+                                if (Math.max(src.getWidth(), src.getHeight()) <= 2560) return;
+                                float[] v = new float[9];
+                                m.getValues(v);
+                                float sx = Math.abs(v[0]), sy = Math.abs(v[4]);
+                                // 只处理纯缩放（无旋转/错切），且确实在缩小
+                                if (Math.abs(v[1]) > 0.001f || Math.abs(v[3]) > 0.001f) return;
+                                if (sx >= 0.98f && sy >= 0.98f) return;
+                                if (sx < 0.05f || sy < 0.05f) return;   // 极小缩略图不动
+                                if (!nearSns() || !inSnsStack()) return;
+                                if (sMatrixBlocked >= 24) return;
+                                sMatrixBlocked++;
+                                p.args[5] = null;   // 去掉缩放变换 → 输出原尺寸
+                                log("★ [朋友圈拦截] Matrix 缩放已取消 sx=" + sx + " sy=" + sy
+                                        + " 源=" + src.getWidth() + "x" + src.getHeight()
+                                        + "（第 " + sMatrixBlocked + " 次）"
+                                        + (sMatrixBlocked <= 3 ? "\n    栈: " + stackBrief() : ""));
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    });
+            log("已挂载 Bitmap.createBitmap(Matrix) 缩放拦截");
+        } catch (Throwable t) {
+            log("hook createBitmap(Matrix) 失败: " + t);
+        }
+
+        // ③ BitmapFactory 解码降采样：inSampleSize>1 / inScaled 会在「解码阶段」就把图缩小。
+        //    sns 上下文下强制全尺寸解码。
+        XC_MethodHook decOpt = new XC_MethodHook() {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam p) {
+                if (!cMomentsRaw) return;
+                try {
+                    android.graphics.BitmapFactory.Options o = null;
+                    for (Object a : p.args) {
+                        if (a instanceof android.graphics.BitmapFactory.Options) {
+                            o = (android.graphics.BitmapFactory.Options) a;
+                            break;
+                        }
+                    }
+                    if (o == null || o.inJustDecodeBounds) return;
+                    // 精确判定「真的会缩小」：inSampleSize>1，或 density 缩放确实生效
+                    boolean densityScale = o.inScaled && o.inDensity > 0 && o.inTargetDensity > 0
+                            && o.inDensity != o.inTargetDensity;
+                    if (o.inSampleSize <= 1 && !densityScale) return;
+                    if (!nearSns() || !inSnsStack()) return;
+                    if (sDecodeBlocked >= 16) return;
+                    sDecodeBlocked++;
+                    log("★ [朋友圈拦截] 解码降采样已取消 inSampleSize=" + o.inSampleSize
+                            + " inScaled=" + o.inScaled + "  " + p.method.getName()
+                            + (sDecodeBlocked <= 3 ? "\n    栈: " + stackBrief() : ""));
+                    o.inSampleSize = 1;
+                    o.inScaled = false;
+                    o.inDensity = 0;
+                    o.inTargetDensity = 0;
+                } catch (Throwable ignored) {
+                }
+            }
+        };
+        try {
+            XposedHelpers.findAndHookMethod(android.graphics.BitmapFactory.class, "decodeFile",
+                    String.class, android.graphics.BitmapFactory.Options.class, decOpt);
+            XposedHelpers.findAndHookMethod(android.graphics.BitmapFactory.class, "decodeStream",
+                    java.io.InputStream.class, android.graphics.Rect.class,
+                    android.graphics.BitmapFactory.Options.class, decOpt);
+            XposedHelpers.findAndHookMethod(android.graphics.BitmapFactory.class, "decodeByteArray",
+                    byte[].class, int.class, int.class,
+                    android.graphics.BitmapFactory.Options.class, decOpt);
+            XposedHelpers.findAndHookMethod(android.graphics.BitmapFactory.class, "decodeFileDescriptor",
+                    java.io.FileDescriptor.class, android.graphics.Rect.class,
+                    android.graphics.BitmapFactory.Options.class, decOpt);
+            log("已挂载 BitmapFactory 解码降采样拦截");
+        } catch (Throwable t) {
+            log("hook BitmapFactory options 失败: " + t);
+        }
+
+        // ④ native 编码器嗅探在「进入朋友圈发布界面」时执行（那时图像库才加载完），见 onCreate 钩。
+    }
+
+    /**
+     * 廉价前置判定：当前前台界面是否与朋友圈相关。
+     * 压缩常发生在后台线程（此时用户可能已离开发布界面回到时间线），
+     * 所以只要界面名里带 sns/Sns 就放行；非朋友圈场景则完全零开销，
+     * 避免每次 Bitmap 解码都去遍历调用栈拖慢微信。
+     */
+    private static boolean nearSns() {
+        String c = sCurrentActivity;
+        if (c == null) return false;
+        return c.contains("sns") || c.contains("Sns");
+    }
+
+    /** 当前调用栈是否来自朋友圈（sns）相关代码 */
+    private static boolean inSnsStack() {
+        try {
+            StackTraceElement[] st = Thread.currentThread().getStackTrace();
+            for (StackTraceElement e : st) {
+                String cn = e.getClassName();
+                if (cn.contains("plugin.sns") || cn.contains(".sns.")
+                        || cn.contains("SnsUpload") || cn.contains("hf4")
+                        || cn.contains("lf4") || cn.contains("gf4")) {
+                    return true;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
+    }
+
+    /** 精简调用栈（跳过系统帧，取微信侧前 10 帧） */
+    private static String stackBrief() {
+        StringBuilder sb = new StringBuilder();
+        try {
+            StackTraceElement[] st = Thread.currentThread().getStackTrace();
+            int n = 0;
+            for (StackTraceElement e : st) {
+                String cn = e.getClassName();
+                if (cn.startsWith("java.lang.Thread") || cn.startsWith("de.robv.android.xposed")
+                        || cn.startsWith("com.abel.wechatlive")) {
+                    continue;
+                }
+                sb.append(cn).append('.').append(e.getMethodName()).append(" ← ");
+                if (++n >= 10) break;
+            }
+        } catch (Throwable ignored) {
+        }
+        return sb.toString();
+    }
+
+    /** 列出微信进程里加载的图像相关 native 库（只打一次），用于定位 native 编码器 */
+    private static void dumpImageNativeLibs() {
+        if (sLibsDumped) return;
+        sLibsDumped = true;
+        EXEC.execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    java.io.BufferedReader r = new java.io.BufferedReader(
+                            new java.io.FileReader("/proc/self/maps"));
+                    java.util.LinkedHashSet<String> hit = new java.util.LinkedHashSet<>();
+                    String line;
+                    while ((line = r.readLine()) != null) {
+                        int i = line.lastIndexOf('/');
+                        if (i < 0 || !line.endsWith(".so")) continue;
+                        String so = line.substring(i + 1);
+                        String low = so.toLowerCase();
+                        if (low.contains("image") || low.contains("jpeg") || low.contains("jpg")
+                                || low.contains("webp") || low.contains("heif") || low.contains("pic")
+                                || low.contains("codec") || low.contains("wechatmm")
+                                || low.contains("mmjpeg") || low.contains("skia")) {
+                            hit.add(so);
+                        }
+                    }
+                    r.close();
+                    log("★ [native 图像库] " + (hit.isEmpty() ? "(无匹配)" : hit.toString()));
+                } catch (Throwable t) {
+                    log("读取 native 库列表失败: " + t);
+                }
+            }
+        });
     }
 
     /** 是否「图片类临时文件」：pre_temp_sns_live_photo* 中、排除纯视频 remux（无 _thumb 后缀） */
