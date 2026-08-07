@@ -14,11 +14,15 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.widget.TextView;
 
+import java.io.File;
+import java.io.FileOutputStream;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
 
@@ -115,7 +119,7 @@ public class MainHook implements IXposedHookLoadPackage {
         sProc = lp.processName;
 
         log("========================================");
-        log("WechatLive v7.4 注入成功  proc=" + sProc);
+        log("WechatLive v7.5 注入成功  proc=" + sProc);
 
         // 相册只在主进程，重量级 hook 只装主进程，避免 :push/:appbrand 等无谓开销
         boolean main = Const.WECHAT_PKG.equals(sProc);
@@ -127,6 +131,7 @@ public class MainHook implements IXposedHookLoadPackage {
         installExtraForcing();
         installLifecycle();
         installCompressProbe();
+        installMomentsProbe();
     }
 
     // ═══════════════ 核心：改写 Intent / Bundle 里的开关键 ═══════════════
@@ -290,13 +295,13 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     /**
-     * 朋友圈原图探测（诊断用，仅「详细日志」开启时生效）：
+     * 朋友圈原图探测（诊断用，仅「朋友圈上传原图」开启时生效，默认零开销）：
      * 微信发朋友圈时会对大图做压缩再上传，真正的画质入口在压缩/编码阶段，
      * 不在 Intent extras（日志已实锤 SnsUploadUI 的 extras 无原图键）。
      * 这里 hook Bitmap.compress，当「面积较大（上传级）且调用栈来自 plugin.sns」时，
-     * 打印完整调用栈——下一次开启详细日志、进朋友圈点发送后导出的日志里，
+     * 打印完整调用栈——下一次开启「朋友圈上传原图」、进朋友圈点发送后导出的日志里，
      * 就能看到微信压缩图片的具体类名/方法，据此实现「复制法/转换法」真正绕过压缩。
-     * 该 hook 只读、不改，且带面积阈值 + 次数上限，默认（详细日志关闭）零开销。
+     * 该 hook 只读、不改，且带面积阈值 + 次数上限，开关关闭时零开销。
      */
     private void installCompressProbe() {
         try {
@@ -309,11 +314,11 @@ public class MainHook implements IXposedHookLoadPackage {
                         private int logged = 0;
                         @Override
                         protected void afterHookedMethod(MethodHookParam p) {
-                            if (!cVerbose || logged >= 8) return;
+                            if (!cMomentsRaw || logged >= 12) return;
                             try {
                                 android.graphics.Bitmap bmp = (android.graphics.Bitmap) p.thisObject;
                                 int area = bmp.getWidth() * bmp.getHeight();
-                                if (area < 500000) return; // 只关心上传级大图压缩，忽略缩略图
+                                if (area < 100000) return; // 只关心上传级大图压缩，忽略缩略图
                                 StackTraceElement[] st = new Throwable().getStackTrace();
                                 boolean sns = false;
                                 StringBuilder sb = new StringBuilder();
@@ -336,10 +341,98 @@ public class MainHook implements IXposedHookLoadPackage {
                             }
                         }
                     });
-            log("已挂载 Bitmap.compress 朋友圈压缩探测（开启「详细日志」后，发朋友圈可抓压缩栈）");
+            log("已挂载 Bitmap.compress 朋友圈压缩探测（开启「朋友圈上传原图」后，发朋友圈可抓压缩栈）");
         } catch (Throwable t) {
             log("挂载 Bitmap.compress 探测失败: " + t);
         }
+    }
+
+    /**
+     * 朋友圈原图「复制法」定位探针（诊断用，仅「朋友圈上传原图」开启时生效，默认零开销）。
+     * 实测：微信发朋友圈的压缩并不走 Java Bitmap.compress（上一版探针零命中），
+     * 而是通过文件写出/读入完成编码。这里钩住两处高频文件操作：
+     *   ① java.io.FileOutputStream —— 微信把压缩后的图写到上传临时文件时；
+     *   ② android.graphics.BitmapFactory.decodeFile —— 微信读取草稿/原图准备处理时。
+     * 凡路径命中朋友圈草稿目录（含 pre_temp / draft / sns）即打印调用栈（去重 + 上限）。
+     * 下次开启「朋友圈上传原图」并真正发一条朋友圈后导出的日志，即可看到微信做压缩/编码的
+     * 具体类名与方法，据此实现「复制法」把原图替换进上传临时文件，绕过压缩管线。
+     * 该探针只读、不改，去重 + 次数上限，开关关闭时完全不挂载热路径。
+     */
+    private void installMomentsProbe() {
+        // ① 文件写出：捕获压缩结果落盘（命中朋友圈草稿/上传临时目录）
+        XC_MethodHook writeHook = new XC_MethodHook() {
+            private int logged = 0;
+            private final Set<String> seen = new HashSet<String>();
+            @Override
+            protected void afterHookedMethod(MethodHookParam p) {
+                if (!cMomentsRaw || logged >= 50) return;
+                try {
+                    Object a0 = p.args[0];
+                    String path = a0 instanceof File ? ((File) a0).getAbsolutePath()
+                            : (a0 instanceof String ? (String) a0 : null);
+                    if (path == null) return;
+                    if (!path.contains("/MicroMsg/")) return;
+                    String low = path.toLowerCase(Locale.US);
+                    if (!(low.contains("pre_temp") || low.contains("/draft/")
+                            || low.contains("sns"))) return;
+                    StackTraceElement[] st = new Throwable().getStackTrace();
+                    String key = st.length > 4 ? (st[4].getClassName() + "." + st[4].getMethodName()) : path;
+                    if (seen.contains(key)) return;
+                    seen.add(key);
+                    logged++;
+                    StringBuilder sb = new StringBuilder();
+                    for (StackTraceElement e : st) {
+                        if (sb.length() < 1800) sb.append("\n    ").append(e.getClassName()).append('.').append(e.getMethodName());
+                        else break;
+                    }
+                    log("★ [朋友圈写探测] path=" + path + " 调用栈(top→底):" + sb);
+                } catch (Throwable ignored) {
+                }
+            }
+        };
+        try { XposedHelpers.findAndHookConstructor(FileOutputStream.class, File.class, writeHook); }
+        catch (Throwable t) { log("hook FOS(File) 失败: " + t); }
+        try { XposedHelpers.findAndHookConstructor(FileOutputStream.class, File.class, boolean.class, writeHook); }
+        catch (Throwable t) { log("hook FOS(File,bool) 失败: " + t); }
+        try { XposedHelpers.findAndHookConstructor(FileOutputStream.class, String.class, writeHook); }
+        catch (Throwable t) { log("hook FOS(String) 失败: " + t); }
+        try { XposedHelpers.findAndHookConstructor(FileOutputStream.class, String.class, boolean.class, writeHook); }
+        catch (Throwable t) { log("hook FOS(String,bool) 失败: " + t); }
+
+        // ② 文件读入：捕获微信读取草稿/原图以做处理的入口
+        try {
+            XposedHelpers.findAndHookMethod(android.graphics.BitmapFactory.class, "decodeFile",
+                    String.class, new XC_MethodHook() {
+                        private int logged = 0;
+                        private final Set<String> seen = new HashSet<String>();
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam p) {
+                            if (!cMomentsRaw || logged >= 30) return;
+                            try {
+                                String path = (String) p.args[0];
+                                if (path == null) return;
+                                if (!path.contains("/MicroMsg/")) return;
+                                String low = path.toLowerCase(Locale.US);
+                                if (!(low.contains("pre_temp") || low.contains("/draft/")
+                                        || low.contains("sns"))) return;
+                                StackTraceElement[] st = new Throwable().getStackTrace();
+                                String key = st.length > 4 ? (st[4].getClassName() + "." + st[4].getMethodName()) : path;
+                                if (seen.contains(key)) return;
+                                seen.add(key);
+                                logged++;
+                                StringBuilder sb = new StringBuilder();
+                                for (StackTraceElement e : st) {
+                                    if (sb.length() < 1800) sb.append("\n    ").append(e.getClassName()).append('.').append(e.getMethodName());
+                                    else break;
+                                }
+                                log("★ [朋友圈读探测] path=" + path + " 调用栈(top→底):" + sb);
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    });
+        } catch (Throwable t) { log("hook BitmapFactory.decodeFile 失败: " + t); }
+
+        log("已挂载朋友圈文件读写探针（开启「朋友圈上传原图」后，发朋友圈可抓压缩/读取栈）");
     }
 
     private static void onResume(final Activity act) {
