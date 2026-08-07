@@ -15,6 +15,7 @@ import android.view.ViewGroup;
 import android.widget.TextView;
 
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.RandomAccessFile;
 import java.text.SimpleDateFormat;
@@ -23,7 +24,9 @@ import java.util.Date;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
+import java.util.WeakHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
 
@@ -86,6 +89,16 @@ public class MainHook implements IXposedHookLoadPackage {
     // 会话内捕获的「原图」路径（相册选中时记下），供诊断与 v7.7 复制法定位压缩源
     private static final List<String> sSelectedPaths = new ArrayList<String>();
 
+    // ── v7.7 复制法状态 ──
+    // 最近一次在朋友圈压缩链里被微信读取的原始图片路径（FileInputStream 探针抓到）
+    private static volatile String sLastOriginalPath;
+    // 已关闭的「基础临时文件」计数（用于按顺序把原图映射到第 N 张图）
+    private static int sBaseTempClosed = 0;
+    // 复制法覆盖进行中标记：避免覆盖动作自身打开的流再次触发探针/递归
+    private static volatile boolean sCopying = false;
+    // 记录微信正在写入的「基础临时文件」对应的 FileOutputStream 实例（WeakHashMap 避免泄漏）
+    private static final Map<Object, String> sFosTemp = new WeakHashMap<Object, String>();
+
     private static String sProc = "?";
     private static long sLastReport = 0L;
     private static int sForceCount = 0;
@@ -122,7 +135,7 @@ public class MainHook implements IXposedHookLoadPackage {
         sProc = lp.processName;
 
         log("========================================");
-        log("WechatLive v7.6 注入成功  proc=" + sProc);
+        log("WechatLive v7.7 注入成功  proc=" + sProc);
 
         // 相册只在主进程，重量级 hook 只装主进程，避免 :push/:appbrand 等无谓开销
         boolean main = Const.WECHAT_PKG.equals(sProc);
@@ -136,6 +149,7 @@ public class MainHook implements IXposedHookLoadPackage {
         installCompressProbe();
         installMomentsProbe();
         installPathCapture();
+        installMomentsCopy();   // v7.7：复制法（用原图替换朋友圈上传临时文件，绕过压缩）
     }
 
     // ═══════════════ 核心：改写 Intent / Bundle 里的开关键 ═══════════════
@@ -368,12 +382,17 @@ public class MainHook implements IXposedHookLoadPackage {
             private final Set<String> seen = new HashSet<String>();
             @Override
             protected void afterHookedMethod(MethodHookParam p) {
-                if (!cMomentsRaw || logged >= 60) return;
+                if (sCopying || !cMomentsRaw || logged >= 60) return;
                 try {
                     Object a0 = p.args[0];
                     String path = a0 instanceof File ? ((File) a0).getAbsolutePath()
                             : (a0 instanceof String ? (String) a0 : null);
                     if (path == null || !isMomentsFile(path)) return;
+                    // 记录「基础临时文件」(pre_temp_sns_live_photo<hash>，无 _parse/_remux/_thumb 后缀)，
+                    // 供 v7.7 复制法在流关闭后把原图覆盖进去。
+                    if (isBaseTemp(path)) {
+                        sFosTemp.put(p.thisObject, path);
+                    }
                     if (seen.contains(path)) return;
                     seen.add(path);
                     logged++;
@@ -453,6 +472,134 @@ public class MainHook implements IXposedHookLoadPackage {
         } catch (Throwable t) { log("hook BitmapFactory.decodeFile 失败: " + t); }
 
         log("已挂载朋友圈文件读写探针(v7.6: 命中即报路径+大小+完整栈；发朋友圈并点发表后可抓压缩/读取栈)");
+    }
+
+    /**
+     * v7.7 复制法核心：用「用户选的原图」替换微信为朋友圈生成的上传临时文件(pre_temp_sns_live_photo*)，
+     * 从而绕过微信的压缩管线，发出原图。
+     *
+     * 原理（基于 v7.5/v7.6 日志实锤）：
+     *   进入 SnsUploadUI 时，微信在链
+     *     SnsUploadUI.V6 → gf4.a.h → plugin.sns.ui.n1.h → hf4.b1.h → hf4.b1.s → hf4.l0.p → lf4.a.d → vfs.w6.d → FileOutputStream(pre_temp_sns_live_photo*)
+     *   里把原图读出来、编码/缩放后写到 MicroMsg 的 draft 临时文件——这个临时文件就是最终上传的内容。
+     *
+     * 做法：
+     *   ① 用 FileInputStream 探针，在「朋友圈压缩链」里抓到微信读取的【原始图片路径】(sLastOriginalPath)。
+     *      （实测 BitmapFactory.decodeFile 零命中，说明微信走流拷贝而非 decodeFile，故必须钩 FileInputStream）
+     *   ② 在 FileOutputStream 关闭后，若它是「基础临时文件」，则把对应原图字节覆盖进去
+     *      （按"已关闭基础临时文件计数"顺序映射到 sSelectedPaths，使第 N 个临时文件 ↔ 第 N 张原图）。
+     *
+     * 仅「朋友圈上传原图」开启时挂载热路径；其余情况零开销。覆盖动作一次成功即停（避免反复写）。
+     */
+    private void installMomentsCopy() {
+        // ① 源捕获：微信在压缩链里用 FileInputStream 读原图
+        XC_MethodHook srcHook = new XC_MethodHook() {
+            @Override
+            protected void afterHookedMethod(MethodHookParam p) {
+                if (sCopying || !cMomentsRaw) return;
+                try {
+                    Object a0 = p.args[0];
+                    String path = a0 instanceof File ? ((File) a0).getAbsolutePath()
+                            : (a0 instanceof String ? (String) a0 : null);
+                    if (path == null) return;
+                    String low = path.toLowerCase(Locale.US);
+                    // 原图在 DCIM/Pictures 等外部目录，不在 MicroMsg 草稿里；且是图片
+                    if (path.contains("/MicroMsg/")) return;
+                    if (!(low.endsWith(".jpg") || low.endsWith(".jpeg") || low.endsWith(".png")
+                            || low.endsWith(".webp"))) return;
+                    // 调用栈必须来自朋友圈压缩链，避免误抓其它读图
+                    StackTraceElement[] st = new Throwable().getStackTrace();
+                    boolean sns = false;
+                    for (StackTraceElement e : st) {
+                        String cn = e.getClassName();
+                        if (cn.contains("plugin.sns") || cn.contains("hf4") || cn.contains("lf4")
+                                || cn.contains("n1.") || cn.contains("gf4") || cn.contains("b1.")
+                                || cn.contains("l0.") || cn.contains("vfs")) {
+                            sns = true;
+                            break;
+                        }
+                    }
+                    if (!sns) return;
+                    sLastOriginalPath = path;
+                    log("★ [朋友圈原图读取] path=" + path);
+                } catch (Throwable ignored) {
+                }
+            }
+        };
+        try { XposedHelpers.findAndHookConstructor(FileInputStream.class, File.class, srcHook); }
+        catch (Throwable t) { log("hook FIS(File) 失败: " + t); }
+        try { XposedHelpers.findAndHookConstructor(FileInputStream.class, String.class, srcHook); }
+        catch (Throwable t) { log("hook FIS(String) 失败: " + t); }
+
+        // ② 覆盖：FileOutputStream 关闭后，把对应原图写回基础临时文件
+        try {
+            XposedHelpers.findAndHookMethod(FileOutputStream.class, "close", new XC_MethodHook() {
+                @Override
+            protected void afterHookedMethod(MethodHookParam p) {
+                if (sCopying || !cMomentsRaw) return;
+                try {
+                    String temp = sFosTemp.remove(p.thisObject);
+                        if (temp == null) return;
+                        if (!isBaseTemp(temp)) return;
+                        int idx = sBaseTempClosed;   // 第 idx 个基础临时文件 ↔ 第 idx 张原图
+                        sBaseTempClosed++;
+                        synchronized (sSelectedPaths) {
+                            if (idx < sSelectedPaths.size()) {
+                                overwriteTempWithOriginal(temp, sSelectedPaths.get(idx));
+                            } else if (sLastOriginalPath != null) {
+                                overwriteTempWithOriginal(temp, sLastOriginalPath);
+                            }
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+            });
+            log("已挂载 朋友圈复制法（原图覆盖上传临时文件，v7.7）");
+        } catch (Throwable t) {
+            log("hook FileOutputStream.close 失败: " + t);
+        }
+    }
+
+    /** 是否「基础临时文件」：pre_temp_sns_live_photo<32位hash>，不含 _parse/_remux/_thumb 后缀 */
+    private static boolean isBaseTemp(String path) {
+        if (path == null) return false;
+        String name = new File(path).getName();
+        if (!name.startsWith("pre_temp_sns_live_photo")) return false;
+        String tail = name.substring("pre_temp_sns_live_photo".length());
+        // 仅允许纯 32 位十六进制 hash（即基础文件）；带其它后缀的是派生文件，不动
+        return tail.matches("[0-9a-fA-F]{32}");
+    }
+
+    /** 把原图覆盖进朋友圈上传临时文件（复制法核心动作）。一次成功即停，避免反复写。 */
+    private static void overwriteTempWithOriginal(String temp, String original) {
+        if (sCopying) return;          // 防止覆盖动作自身的流递归触发
+        sCopying = true;
+        try {
+            File src = new File(original);
+            File dst = new File(temp);
+            if (!src.exists() || src.length() < 1024) {
+                log("复制法跳过: 原图不存在或过小 original=" + original);
+                return;
+            }
+            long cur = dst.length();
+            if (cur == src.length() && dst.exists()) {
+                log("复制法跳过: 临时文件已为原图大小 temp=" + temp);
+                return;
+            }
+            FileInputStream in = new FileInputStream(src);
+            java.io.FileOutputStream out = new java.io.FileOutputStream(dst, false);
+            byte[] buf = new byte[1 << 16];
+            int n;
+            while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+            in.close();
+            out.close();
+            log("★ [复制法] 已用原图覆盖上传临时文件 temp=" + temp
+                    + " 原图=" + original + " size=" + dst.length());
+        } catch (Throwable t) {
+            log("复制法覆盖失败: temp=" + temp + " err=" + t);
+        } finally {
+            sCopying = false;
+        }
     }
 
     /** 是否朋友圈相关图片文件：MicroMsg 目录下、命中草稿/临时/上传目录或图片扩展名（排除 db/ini） */
@@ -545,10 +692,12 @@ public class MainHook implements IXposedHookLoadPackage {
             log("★ 朋友圈发布界面：已抓取该界面全部 Intent extras（见上方）。");
             log("  诊断已落盘——请在本界面停留约 1 秒，再回 App「导出日志」即可拿到完整抓取。");
             log("  如需 View 树，请开启「详细日志」后重新进入本界面。");
-            StringBuilder ps = new StringBuilder("★ 本次会话已捕获原图路径(" + sSelectedPaths.size() + "):");
+            StringBuilder ps = new StringBuilder("★ 本次会话已捕获原图路径(Intent=" + sSelectedPaths.size()
+                    + "  FileInputStream探针=" + (sLastOriginalPath != null ? 1 : 0) + "):");
             synchronized (sSelectedPaths) {
-                for (String s : sSelectedPaths) ps.append("\n    ").append(s);
+                for (String s : sSelectedPaths) ps.append("\n    [Intent] ").append(s);
             }
+            if (sLastOriginalPath != null) ps.append("\n    [FileInputStream] ").append(sLastOriginalPath);
             log(ps.toString());
         }
 
