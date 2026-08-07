@@ -23,16 +23,24 @@ jobs:
       # 类校验就会 NoClassDefFoundError → 「打开模块就闪退」（v3 的原因）。
       - name: Guard - UI classes must not touch Xposed
         run: |
-          BAD=0
-          for f in MainActivity StatusProvider LogStore Const; do
-            P="app/src/main/java/com/abel/wechatlive/$f.java"
-            if grep -nE 'de\.robv\.android\.xposed|XposedBridge|XposedHelpers|MainHook' "$P"; then
-              echo "::error::$f.java 引用了 Xposed/MainHook，会导致模块 App 闪退"
-              BAD=1
-            fi
-          done
-          [ "$BAD" = "0" ] && echo "OK: UI 层与 Xposed 完全隔离"
-          exit $BAD
+          python3 - <<'PY'
+          import re, sys, pathlib
+          BASE = pathlib.Path('app/src/main/java/com/abel/wechatlive')
+          PAT = re.compile(r'de\.robv\.android\.xposed|XposedBridge|XposedHelpers|\bMainHook\b')
+          bad = False
+          for name in ['MainActivity', 'StatusProvider', 'LogStore', 'Const']:
+              src = (BASE / (name + '.java')).read_text(encoding='utf-8')
+              # 先剥离块注释与行注释，避免误伤说明文字
+              code = re.sub(r'/\*.*?\*/', '', src, flags=re.S)
+              code = re.sub(r'//[^\n]*', '', code)
+              for i, line in enumerate(code.splitlines(), 1):
+                  if PAT.search(line):
+                      print('::error::%s.java:%d 引用了 Xposed/MainHook，会导致模块 App 闪退 -> %s'
+                            % (name, i, line.strip()))
+                      bad = True
+          print('OK: UI 层与 Xposed 完全隔离' if not bad else 'GUARD FAILED')
+          sys.exit(1 if bad else 0)
+          PY
 
       - name: Build debug APK (auto-signed with debug key)
         uses: gradle/gradle-build-action@v3
