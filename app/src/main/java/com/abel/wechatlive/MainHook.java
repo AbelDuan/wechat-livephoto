@@ -131,6 +131,10 @@ public class MainHook implements IXposedHookLoadPackage {
     private static volatile boolean sInjecting = false;
     private static volatile int sRawInjected = 0;      // 原图字节直塞成功次数
     private static volatile int sQualityBoost = 0;     // quality 拉满次数
+    // v8.2 复制法：按尺寸匹配原图覆盖上传临时文件
+    private static volatile int sCopyInjected = 0;     // 复制法成功次数
+    private static volatile int sCopyLogged = 0;       // 复制法跳过说明限次
+    private static volatile int sMainProbe = 0;        // 主图 compress 到达诊断限次
 
     private static String sProc = "?";
     private static long sLastReport = 0L;
@@ -168,7 +172,7 @@ public class MainHook implements IXposedHookLoadPackage {
         sProc = lp.processName;
 
         log("========================================");
-        log("WechatLive v8.1 注入成功  proc=" + sProc);
+        log("WechatLive v8.2 注入成功  proc=" + sProc);
 
         // 相册只在主进程，重量级 hook 只装主进程，避免 :push/:appbrand 等无谓开销
         boolean main = Const.WECHAT_PKG.equals(sProc);
@@ -405,14 +409,23 @@ public class MainHook implements IXposedHookLoadPackage {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam p) {
                             if (!cMomentsRaw || sInjecting) return;
-                            if (!nearSns()) return;              // 廉价前置，非朋友圈场景零开销
                             try {
                                 android.graphics.Bitmap bmp = (android.graphics.Bitmap) p.thisObject;
                                 if (bmp == null || bmp.isRecycled()) return;
                                 int w = bmp.getWidth(), h = bmp.getHeight();
                                 // 只处理「上传级主图」：>200 万像素。缩略图一律不动。
                                 if ((long) w * h < 2000000L) return;
-                                if (!inSnsStack()) return;
+                                // v8.2：放宽门槛。主图 compress 可能在「上传线程」上、调用栈不含
+                                // plugin.sns（缩略图却在），故改为「当前界面是朋友圈/相册」或「栈含 sns」任一即可。
+                                boolean near = nearSns();
+                                boolean ins = inSnsStack();
+                                if (!near && !ins) return;
+                                // 诊断：确认主图 compress 是否真的走到这里（之前日志里完全看不到主图 compress）
+                                if (sMainProbe < 4) {
+                                    sMainProbe++;
+                                    log("★ [主图compress] reached " + w + "x" + h
+                                            + " nearSns=" + near + " inSnsStack=" + ins);
+                                }
 
                                 boolean jpeg = String.valueOf(p.args[0]).toUpperCase(Locale.US).contains("JPEG");
 
@@ -568,6 +581,7 @@ public class MainHook implements IXposedHookLoadPackage {
      */
     private static String matchIn(List<String> list, int w, int h) {
         String swapped = null;
+        String fuzzy = null;
         for (int i = list.size() - 1; i >= 0; i--) {
             String path = list.get(i);
             try {
@@ -578,16 +592,52 @@ public class MainHook implements IXposedHookLoadPackage {
                 int[] wh = boundsOf(path);
                 if (wh == null) continue;
                 if (wh[0] == w && wh[1] == h) return path;                    // 精确命中，最优
+                if (fuzzy == null && Math.abs(wh[0] - w) <= 4 && Math.abs(wh[1] - h) <= 4) {
+                    fuzzy = path;                                             // 容差命中(±4px)，次优
+                }
                 if (swapped == null && wh[0] == h && wh[1] == w && isRotated90(path)) {
-                    swapped = path;                                           // 暂存，继续找精确的
+                    swapped = path;                                           // 宽高互换+旋转，最后兜底
                 }
             } catch (Throwable ignored) {
             }
         }
         if (swapped != null) {
             log("★ [直塞决策] 按 EXIF 旋转匹配（宽高互换）命中 " + shortPath(swapped));
+        } else if (fuzzy != null) {
+            log("★ [直塞决策] 容差匹配(±4px)命中 " + shortPath(fuzzy));
         }
-        return swapped;
+        return swapped != null ? swapped : fuzzy;
+    }
+
+    /** 同 matchIn，但不打日志——供复制法在关闭临时文件时按尺寸静默找原图 */
+    private static String matchInQuiet(List<String> list, int w, int h) {
+        String swapped = null;
+        String fuzzy = null;
+        for (int i = list.size() - 1; i >= 0; i--) {
+            String path = list.get(i);
+            try {
+                File f = new File(path);
+                if (!f.isFile()) continue;
+                long len = f.length();
+                if (len < 300 * 1024L || len > 40 * 1024 * 1024L) continue;
+                int[] wh = boundsOf(path);
+                if (wh == null) continue;
+                if (wh[0] == w && wh[1] == h) return path;
+                if (fuzzy == null && Math.abs(wh[0] - w) <= 4 && Math.abs(wh[1] - h) <= 4) fuzzy = path;
+                if (swapped == null && wh[0] == h && wh[1] == w && isRotated90(path)) swapped = path;
+            } catch (Throwable ignored) {
+            }
+        }
+        return swapped != null ? swapped : fuzzy;
+    }
+
+    /** v8.2：按临时文件当前尺寸，在候选池+相册目录里找尺寸一致的原图（复制法用） */
+    private static String findOriginalForDims(int w, int h) {
+        List<String> cands;
+        synchronized (sPhotoCandidates) { cands = new ArrayList<String>(sPhotoCandidates); }
+        String hit = matchInQuiet(cands, w, h);
+        if (hit != null) return hit;
+        return matchInQuiet(scanPhotoDirs(), w, h);
     }
 
     /** 原图 EXIF 是否标记了 90/270 度旋转（此时解码转正后宽高会互换） */
@@ -895,7 +945,9 @@ public class MainHook implements IXposedHookLoadPackage {
         try { XposedHelpers.findAndHookConstructor(FileInputStream.class, String.class, srcHook); }
         catch (Throwable t) { log("hook FIS(String) 失败: " + t); }
 
-        // ② 覆盖：FileOutputStream 关闭后，把对应原图写回基础临时文件
+        // ② 覆盖：FileOutputStream 关闭后，按临时文件「当前尺寸」静默匹配原图并覆盖
+        //    v8.2：不再用单一 sLastOriginalPath（多图时会被串味），改为读临时文件尺寸，
+        //    在候选池+相册目录里找尺寸一致的原图——编码器无关，主图走哪条编码链都能接住。
         try {
             XposedHelpers.findAndHookMethod(FileOutputStream.class, "close", new XC_MethodHook() {
                 @Override
@@ -905,15 +957,29 @@ public class MainHook implements IXposedHookLoadPackage {
                     String temp = sFosTemp.remove(p.thisObject);
                     if (temp == null) return;
                     if (isVideoRemux(temp)) return;   // 实况视频流，绝不覆盖
-                    // 用最近一次在朋友圈压缩链里抓到的原图覆盖（FIS 探针比 Intent 路径更可靠）
-                    if (sLastOriginalPath != null) {
-                        overwriteTempWithOriginal(temp, sLastOriginalPath);
+                    int[] twh = boundsOf(temp);       // 临时文件已被微信写入（重编码后）的尺寸
+                    if (twh == null || twh[0] <= 0 || twh[1] <= 0) {
+                        if (sCopyLogged < 6) { sCopyLogged++;
+                            log("★ [复制法跳过] 临时文件无法读尺寸 temp=" + shortPath(temp));
+                        }
+                        return;
+                    }
+                    String orig = findOriginalForDims(twh[0], twh[1]);
+                    if (orig != null) {
+                        overwriteTempWithOriginal(temp, orig);
+                        sCopyInjected++;
+                        log("★ [复制法注入] temp=" + shortPath(temp) + " " + twh[0] + "x" + twh[1]
+                                + " ← " + shortPath(orig) + " 第" + sCopyInjected + "次");
+                    } else if (sCopyLogged < 6) {
+                        sCopyLogged++;
+                        log("★ [复制法跳过] 无尺寸匹配原图 temp=" + shortPath(temp)
+                                + " " + twh[0] + "x" + twh[1] + " " + candidateSummary());
                     }
                 } catch (Throwable ignored) {
                 }
                 }
             });
-            log("已挂载 朋友圈复制法（原图覆盖上传临时文件，v7.7）");
+            log("已挂载 朋友圈复制法（原图覆盖上传临时文件，v8.2 按尺寸匹配）");
         } catch (Throwable t) {
             log("hook FileOutputStream.close 失败: " + t);
         }
@@ -1169,10 +1235,11 @@ public class MainHook implements IXposedHookLoadPackage {
     private static boolean isImageTemp(String path) {
         if (path == null) return false;
         String name = new File(path).getName();
-        if (!name.startsWith("pre_temp_sns_live_photo")) return false;
-        if (name.contains("_thumb")) return false;                  // 缩略图，绝不塞原图
-        if (name.matches("pre_temp_sns_live_photo_remux_[0-9a-fA-F]{32}")) return false;  // 实况视频流
-        return true;
+        String pre = "pre_temp_sns_live_photo";
+        if (!name.startsWith(pre)) return false;
+        // 基础上传文件：pre_temp_sns_live_photo<hash>（hash 直接接在后面，无额外下划线段）。
+        // _parse / _remux / _thumb 都是派生文件，绝不塞原图。
+        return name.indexOf('_', pre.length()) < 0;
     }
 
     /** 是否纯视频 remux（实况视频流）或缩略图，复制法必须跳过 */
@@ -1316,6 +1383,8 @@ public class MainHook implements IXposedHookLoadPackage {
                 for (String s : sSelectedPaths) ps.append("\n    [Intent] ").append(s);
             }
             if (sLastOriginalPath != null) ps.append("\n    [FileInputStream] ").append(sLastOriginalPath);
+            ps.append("\n  ★ 注入统计：原图直塞=" + sRawInjected
+                    + "  质量拉满=" + sQualityBoost + "  复制法=" + sCopyInjected);
             log(ps.toString());
         }
 
