@@ -107,6 +107,28 @@ public final class LogStore {
         return new ArrayList<String>(all.subList(all.size() - n, all.size()));
     }
 
+    /** 读取整个日志文件内容（用于导出）。文件不存在返回空串。 */
+    public static synchronized String readFully(Context c) {
+        File f = file(c);
+        if (!f.exists()) return "";
+        java.io.FileInputStream fis = null;
+        try {
+            fis = new java.io.FileInputStream(f);
+            byte[] buf = new byte[(int) f.length()];
+            int n = fis.read(buf);
+            return new String(buf, 0, n < 0 ? 0 : n, "UTF-8");
+        } catch (Throwable t) {
+            return "[读取失败] " + t;
+        } finally {
+            if (fis != null) {
+                try {
+                    fis.close();
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+    }
+
     private static void close(FileOutputStream fos) {
         if (fos != null) {
             try {

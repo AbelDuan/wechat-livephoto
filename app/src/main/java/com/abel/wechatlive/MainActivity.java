@@ -4,7 +4,9 @@ import android.app.Activity;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
+import android.content.Intent;
 import android.content.SharedPreferences;
+import android.net.Uri;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.os.Bundle;
@@ -21,6 +23,8 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import java.io.File;
+import java.io.FileOutputStream;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.text.SimpleDateFormat;
@@ -135,8 +139,8 @@ public class MainActivity extends Activity {
                 "默认开启「实况」(Gallery_LivePhoto_Auto_Enable)");
         cbOrig = addCheck(box, Const.K_ORIG, true,
                 "默认开启「原图」(send_raw_img)");
-        cbVerbose = addCheck(box, Const.K_VERBOSE, true,
-                "详细日志（导出 View 树，排障用）");
+        cbVerbose = addCheck(box, Const.K_VERBOSE, false,
+                "详细日志（导出 View 树，排障用；默认关，省电）");
 
         root.addView(box, mw());
 
@@ -166,6 +170,16 @@ public class MainActivity extends Activity {
             }
         }), eq());
         root.addView(bar, mw());
+
+        // ── 导出日志（写文件 + 系统分享面板，绕开剪贴板长度限制）──
+        Button exportBtn = btn("导出日志（写文件并分享）", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                exportLog();
+            }
+        });
+        exportBtn.setPadding(dp(8), dp(10), dp(8), dp(10));
+        root.addView(exportBtn, mw());
 
         // ── 日志区 ──
         logView = new TextView(this);
@@ -291,6 +305,44 @@ public class MainActivity extends Activity {
             }
         } catch (Throwable t) {
             toast("复制失败：" + t);
+        }
+    }
+
+    /**
+     * 导出日志：把 App 私有目录里的全部日志写到外部私有目录（无需任何存储权限），
+     * 再调起系统分享面板，选任意 App（邮件 / 微信文件传输 / WorkBuddy 等）发送。
+     * 文件同时落在 /sdcard/Android/data/com.abel.wechatlive/files/ 下，文件管理器也能直接取。
+     */
+    private void exportLog() {
+        try {
+            String content = LogStore.readFully(this);
+            if (content == null || content.length() == 0) {
+                toast("日志为空，暂无可导出内容");
+                return;
+            }
+            File dir = getExternalFilesDir(null);
+            if (dir == null) {
+                toast("外部存储不可用，无法导出");
+                return;
+            }
+            String ts = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
+            File out = new File(dir, "WechatLive_" + ts + ".log");
+            FileOutputStream fos = new FileOutputStream(out);
+            try {
+                fos.write(content.getBytes("UTF-8"));
+            } finally {
+                fos.close();
+            }
+            Uri uri = Uri.parse("content://" + LogFileProvider.AUTH + "/" + out.getName());
+            Intent share = new Intent(Intent.ACTION_SEND);
+            share.setType("text/plain");
+            share.putExtra(Intent.EXTRA_STREAM, uri);
+            share.putExtra(Intent.EXTRA_SUBJECT, "WechatLive 日志 " + ts);
+            share.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            startActivity(Intent.createChooser(share, "导出日志：选择一个应用发送"));
+            toast("已导出到 " + out.getAbsolutePath());
+        } catch (Throwable t) {
+            toast("导出失败：" + t.getClass().getSimpleName());
         }
     }
 

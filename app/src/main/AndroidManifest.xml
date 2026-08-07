@@ -31,6 +31,14 @@
             android:enabled="true"
             android:exported="true" />
 
+        <!-- 导出日志专用：把外部私有目录里的日志文件以 content:// 暴露给其它 App 读取。
+             exported=false + grantUriPermissions=true：仅本次分享授权的 App 能读，安全。 -->
+        <provider
+            android:name=".LogFileProvider"
+            android:authorities="com.abel.wechatlive.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true" />
+
         <!-- ===== LSPosed / Xposed 模块声明 ===== -->
         <meta-data
             android:name="xposedmodule"

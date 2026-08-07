@@ -4,6 +4,8 @@ import android.app.Activity;
 import android.content.ContentResolver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.PackageInfo;
+import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
@@ -17,6 +19,8 @@ import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.Executor;
+import java.util.concurrent.Executors;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -79,11 +83,17 @@ public class MainHook implements IXposedHookLoadPackage {
     private static long sLastReport = 0L;
     private static int sForceCount = 0;
 
+    // 微信版本号缓存（首次 onResume 时从 PackageManager 取，避免每次查询）
+    private static String sWxVer;
+    // 单一后台线程池：上报走它，避免每次 onResume 都 new Thread（省开销）
+    private static final Executor EXEC = Executors.newSingleThreadExecutor();
+
     // 用户开关（默认全开；取不到配置时按默认走）
     private static volatile boolean cEnabled = true;
     private static volatile boolean cLive = true;
     private static volatile boolean cOrig = true;
-    private static volatile boolean cVerbose = true;
+    // 详细日志(导出 View 树)默认关闭——这是最大的功耗点，排障时再打开
+    private static volatile boolean cVerbose = false;
 
     // ⚠️ 绝不能是 static final 直接 new —— 见类注释
     private static volatile Handler sHandler;
@@ -345,17 +355,20 @@ public class MainHook implements IXposedHookLoadPackage {
     private static void report(final Context ctx, final String cls) {
         if (ctx == null) return;
         long now = System.currentTimeMillis();
-        if (now - sLastReport < 800) return; // 限流
+        if (now - sLastReport < 1500) return; // 限流：1.5s 一次足够，减少 IPC 频率
         sLastReport = now;
 
         final String payload = drainPending();
-        new Thread(new Runnable() {
+        final String ver = wxVersion(ctx);
+        EXEC.execute(new Runnable() {
             @Override
             public void run() {
                 try {
                     ContentResolver cr = ctx.getContentResolver();
                     Bundle in = new Bundle();
-                    in.putString("activity", cls);
+                    // 键名必须用 Const 常量，与 StatusProvider 读取端严格对应
+                    in.putString(Const.K_LAST_ACT, cls);   // 最近界面
+                    in.putString(Const.K_WX_VER, ver);     // 微信版本
                     in.putString("proc", sProc);
                     in.putInt("forced", sForceCount);
                     if (payload.length() > 0) in.putString(Const.KEY_LOG, payload);
@@ -366,13 +379,26 @@ public class MainHook implements IXposedHookLoadPackage {
                         cEnabled = out.getBoolean(Const.K_ENABLED, true);
                         cLive = out.getBoolean(Const.K_LIVE, true);
                         cOrig = out.getBoolean(Const.K_ORIG, true);
-                        cVerbose = out.getBoolean(Const.K_VERBOSE, true);
+                        cVerbose = out.getBoolean(Const.K_VERBOSE, false);
                     }
                 } catch (Throwable t) {
                     // 模块 App 被冻结/未安装时会走到这里，忽略即可
                 }
             }
-        }, "wclp-report").start();
+        });
+    }
+
+    /** 取微信版本号（宿主上下文的包名即为 com.tencent.mm）。zygote 阶段不会调用本方法。 */
+    private static String wxVersion(Context ctx) {
+        if (sWxVer != null) return sWxVer;
+        try {
+            PackageManager pm = ctx.getPackageManager();
+            PackageInfo pi = pm.getPackageInfo(ctx.getPackageName(), 0);
+            sWxVer = (pi.versionName != null) ? pi.versionName : "?";
+        } catch (Throwable t) {
+            sWxVer = "?";
+        }
+        return sWxVer;
     }
 
     // ══════════════════════════ 工具 ══════════════════════════
