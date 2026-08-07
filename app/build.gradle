@@ -6,8 +6,8 @@ android {
         applicationId "com.abel.wechatlive"
         minSdkVersion 24
         targetSdkVersion 28
-        versionCode 8
-        versionName "7.1"
+        versionCode 9
+        versionName "7.2"
         // 必须单 dex：见 gradle.properties 说明
         multiDexEnabled false
     }

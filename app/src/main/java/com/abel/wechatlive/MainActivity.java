@@ -57,7 +57,7 @@ public class MainActivity extends Activity {
     private TextView statusView;
     private TextView detailView;
     private TextView logView;
-    private CheckBox cbEnabled, cbLive, cbOrig, cbVerbose, cbLog;
+    private CheckBox cbEnabled, cbLive, cbOrig, cbVerbose, cbLog, cbMomentsRaw;
     private Button iconBtn;
 
     private final Handler ticker = new Handler(Looper.getMainLooper());
@@ -141,6 +141,8 @@ public class MainActivity extends Activity {
                 "默认开启「实况」(Gallery_LivePhoto_Auto_Enable)");
         cbOrig = addCheck(box, Const.K_ORIG, true,
                 "默认开启「原图」(send_raw_img)");
+        cbMomentsRaw = addCheck(box, Const.K_MOMENTS_RAW, false,
+                "朋友圈上传原图（默认关；开启后可能与「制作视频」按钮重叠）");
         cbVerbose = addCheck(box, Const.K_VERBOSE, false,
                 "详细日志（导出 View 树，排障用；默认关，省电）");
         cbLog = addCheck(box, Const.K_LOG, false,

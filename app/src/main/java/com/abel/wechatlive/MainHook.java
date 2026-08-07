@@ -100,6 +100,8 @@ public class MainHook implements IXposedHookLoadPackage {
     private static volatile boolean cVerbose = false;
     // 日志记录(写入 App 文件，供导出/排查)默认关闭——省电，心跳自检不受影响
     private static volatile boolean cLog = false;
+    // 朋友圈上传原图（默认关闭；开启后朋友圈发布界面会强制原图键，可能与「制作视频」按钮重叠）
+    private static volatile boolean cMomentsRaw = false;
 
     // ⚠️ 绝不能是 static final 直接 new —— 见类注释
     private static volatile Handler sHandler;
@@ -139,10 +141,16 @@ public class MainHook implements IXposedHookLoadPackage {
             if (K_LIVE_QUERY.equals(key)) return Boolean.TRUE;
         }
         if (cOrig) {
-            // 原图按钮/原图开关：朋友圈发布界面(SnsUploadUI)排除。
-            // 朋友圈布局没有为「原图」预留位置，强制会出现与「制作视频」重叠的幽灵按钮；
-            // 且 send_raw_img 在朋友圈流程未必改变压缩画质。仅相册/聊天发送流程强开。
-            if (isMomentsPublisher(sCurrentActivity)) return null;
+            // 原图按钮/原图开关：相册/聊天发送流程强开；
+            // 朋友圈发布界面默认排除（避免与「制作视频」重叠的幽灵按钮）。
+            if (!isMomentsPublisher(sCurrentActivity)) {
+                if (K_SEND_RAW.equals(key)) return Boolean.TRUE;
+                if (K_SHOW_RAW_BTN.equals(key)) return Boolean.TRUE;
+            }
+        }
+        if (cMomentsRaw && isMomentsPublisher(sCurrentActivity)) {
+            // 朋友圈上传原图：单独开关控制，开启后在该界面强制原图键。
+            // 注意：这只能控制 Intent 层，真正绕过压缩需要后续定位图片压缩类。
             if (K_SEND_RAW.equals(key)) return Boolean.TRUE;
             if (K_SHOW_RAW_BTN.equals(key)) return Boolean.TRUE;
         }
@@ -296,8 +304,12 @@ public class MainHook implements IXposedHookLoadPackage {
 
         if (!gallery) return;     // 非相册界面：仅心跳，不做 extras 验证
 
-        // 相册界面：把实际生效的 extras 打出来，直接验证强制是否成功
+        // 相册 / 朋友圈发布界面：把实际生效的 extras 打出来
         dumpIntentExtras(act);
+
+        if (isMomentsPublisher(cls)) {
+            log("进入朋友圈发布界面；如需定位图片压缩类，请开启「详细日志」并发一条朋友圈");
+        }
 
         if (!cVerbose) return;
         Handler h = ui();
@@ -341,7 +353,9 @@ public class MainHook implements IXposedHookLoadPackage {
     private static boolean looksLikeGallery(String cls) {
         if (cls == null) return false;
         String l = cls.toLowerCase(Locale.US);
-        return l.contains("gallery") || l.contains("album") || l.contains("imagepreview");
+        // 朋友圈发布界面也纳入，以便 dump 该界面的原图 extras 并帮助后续定位压缩类
+        return l.contains("gallery") || l.contains("album") || l.contains("imagepreview")
+                || l.contains("snsupload");
     }
 
     /** 朋友圈发布界面（com.tencent.mm.plugin.sns.ui.SnsUploadUI 等） */
@@ -419,6 +433,7 @@ public class MainHook implements IXposedHookLoadPackage {
                         cOrig = out.getBoolean(Const.K_ORIG, true);
                         cVerbose = out.getBoolean(Const.K_VERBOSE, false);
                         cLog = out.getBoolean(Const.K_LOG, false);
+                        cMomentsRaw = out.getBoolean(Const.K_MOMENTS_RAW, false);
                     }
                 } catch (Throwable t) {
                     // 模块 App 被冻结/未安装时会走到这里，忽略即可

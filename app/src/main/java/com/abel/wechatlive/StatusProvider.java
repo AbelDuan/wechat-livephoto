@@ -62,6 +62,7 @@ public class StatusProvider extends ContentProvider {
         out.putBoolean(Const.K_ORIG, sp.getBoolean(Const.K_ORIG, true));
         out.putBoolean(Const.K_VERBOSE, sp.getBoolean(Const.K_VERBOSE, false));
         out.putBoolean(Const.K_LOG, sp.getBoolean(Const.K_LOG, false));
+        out.putBoolean(Const.K_MOMENTS_RAW, sp.getBoolean(Const.K_MOMENTS_RAW, false));
         out.putBoolean("ok", true);
         return out;
     }
