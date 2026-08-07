@@ -16,6 +16,7 @@ import android.widget.TextView;
 
 import java.io.File;
 import java.io.FileOutputStream;
+import java.io.RandomAccessFile;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
@@ -82,6 +83,8 @@ public class MainHook implements IXposedHookLoadPackage {
 
     // ── 纯 Java 静态字段，zygote 阶段安全 ──
     private static final List<String> PENDING = new ArrayList<String>();
+    // 会话内捕获的「原图」路径（相册选中时记下），供诊断与 v7.7 复制法定位压缩源
+    private static final List<String> sSelectedPaths = new ArrayList<String>();
 
     private static String sProc = "?";
     private static long sLastReport = 0L;
@@ -119,7 +122,7 @@ public class MainHook implements IXposedHookLoadPackage {
         sProc = lp.processName;
 
         log("========================================");
-        log("WechatLive v7.5 注入成功  proc=" + sProc);
+        log("WechatLive v7.6 注入成功  proc=" + sProc);
 
         // 相册只在主进程，重量级 hook 只装主进程，避免 :push/:appbrand 等无谓开销
         boolean main = Const.WECHAT_PKG.equals(sProc);
@@ -132,6 +135,7 @@ public class MainHook implements IXposedHookLoadPackage {
         installLifecycle();
         installCompressProbe();
         installMomentsProbe();
+        installPathCapture();
     }
 
     // ═══════════════ 核心：改写 Intent / Bundle 里的开关键 ═══════════════
@@ -349,57 +353,79 @@ public class MainHook implements IXposedHookLoadPackage {
 
     /**
      * 朋友圈原图「复制法」定位探针（诊断用，仅「朋友圈上传原图」开启时生效，默认零开销）。
-     * 实测：微信发朋友圈的压缩并不走 Java Bitmap.compress（上一版探针零命中），
-     * 而是通过文件写出/读入完成编码。这里钩住两处高频文件操作：
-     *   ① java.io.FileOutputStream —— 微信把压缩后的图写到上传临时文件时；
-     *   ② android.graphics.BitmapFactory.decodeFile —— 微信读取草稿/原图准备处理时。
-     * 凡路径命中朋友圈草稿目录（含 pre_temp / draft / sns）即打印调用栈（去重 + 上限）。
-     * 下次开启「朋友圈上传原图」并真正发一条朋友圈后导出的日志，即可看到微信做压缩/编码的
-     * 具体类名与方法，据此实现「复制法」把原图替换进上传临时文件，绕过压缩管线。
-     * 该探针只读、不改，去重 + 次数上限，开关关闭时完全不挂载热路径。
+     * 实测：微信发朋友圈的压缩不走 Java Bitmap.compress（v7.4 探针零命中），而是通过文件写出
+     * 完成（v7.5 已实锤微信文件写经 com.tencent.mm.vfs → java.io.FileOutputStream，`.ini` 即此路径）。
+     * 这里钩住三处文件操作，凡路径命中朋友圈图片相关目录/扩展名，即打印：路径 + 文件大小 + 完整调用栈。
+     *   ① java.io.FileOutputStream —— 压缩结果落盘（上传临时文件）
+     *   ② java.io.RandomAccessFile —— 部分写盘路径（防 Bitmap.compress 之外的 native 旁路）
+     *   ③ android.graphics.BitmapFactory.decodeFile —— 微信读取草稿/原图准备处理
+     * 去重按「完整路径」(每个临时文件只报一次)，写 60 次 / 读 30 次 / RAF 20 次上限。
+     * 开关关闭时完全不挂载热路径（零开销）。
      */
     private void installMomentsProbe() {
-        // ① 文件写出：捕获压缩结果落盘（命中朋友圈草稿/上传临时目录）
-        XC_MethodHook writeHook = new XC_MethodHook() {
+        XC_MethodHook logWrite = new XC_MethodHook() {
             private int logged = 0;
             private final Set<String> seen = new HashSet<String>();
             @Override
             protected void afterHookedMethod(MethodHookParam p) {
-                if (!cMomentsRaw || logged >= 50) return;
+                if (!cMomentsRaw || logged >= 60) return;
                 try {
                     Object a0 = p.args[0];
                     String path = a0 instanceof File ? ((File) a0).getAbsolutePath()
                             : (a0 instanceof String ? (String) a0 : null);
-                    if (path == null) return;
-                    if (!path.contains("/MicroMsg/")) return;
-                    String low = path.toLowerCase(Locale.US);
-                    if (!(low.contains("pre_temp") || low.contains("/draft/")
-                            || low.contains("sns"))) return;
-                    StackTraceElement[] st = new Throwable().getStackTrace();
-                    String key = st.length > 4 ? (st[4].getClassName() + "." + st[4].getMethodName()) : path;
-                    if (seen.contains(key)) return;
-                    seen.add(key);
+                    if (path == null || !isMomentsFile(path)) return;
+                    if (seen.contains(path)) return;
+                    seen.add(path);
                     logged++;
+                    long sz = safeSize(path);
                     StringBuilder sb = new StringBuilder();
-                    for (StackTraceElement e : st) {
-                        if (sb.length() < 1800) sb.append("\n    ").append(e.getClassName()).append('.').append(e.getMethodName());
+                    for (StackTraceElement e : new Throwable().getStackTrace()) {
+                        if (sb.length() < 3000) sb.append("\n    ").append(e.getClassName()).append('.').append(e.getMethodName());
                         else break;
                     }
-                    log("★ [朋友圈写探测] path=" + path + " 调用栈(top→底):" + sb);
+                    log("★ [朋友圈写探测] path=" + path + " size=" + sz + " 调用栈(top→底):" + sb);
                 } catch (Throwable ignored) {
                 }
             }
         };
-        try { XposedHelpers.findAndHookConstructor(FileOutputStream.class, File.class, writeHook); }
+        try { XposedHelpers.findAndHookConstructor(FileOutputStream.class, File.class, logWrite); }
         catch (Throwable t) { log("hook FOS(File) 失败: " + t); }
-        try { XposedHelpers.findAndHookConstructor(FileOutputStream.class, File.class, boolean.class, writeHook); }
+        try { XposedHelpers.findAndHookConstructor(FileOutputStream.class, File.class, boolean.class, logWrite); }
         catch (Throwable t) { log("hook FOS(File,bool) 失败: " + t); }
-        try { XposedHelpers.findAndHookConstructor(FileOutputStream.class, String.class, writeHook); }
+        try { XposedHelpers.findAndHookConstructor(FileOutputStream.class, String.class, logWrite); }
         catch (Throwable t) { log("hook FOS(String) 失败: " + t); }
-        try { XposedHelpers.findAndHookConstructor(FileOutputStream.class, String.class, boolean.class, writeHook); }
+        try { XposedHelpers.findAndHookConstructor(FileOutputStream.class, String.class, boolean.class, logWrite); }
         catch (Throwable t) { log("hook FOS(String,bool) 失败: " + t); }
 
-        // ② 文件读入：捕获微信读取草稿/原图以做处理的入口
+        XC_MethodHook logRaf = new XC_MethodHook() {
+            private int logged = 0;
+            private final Set<String> seen = new HashSet<String>();
+            @Override
+            protected void afterHookedMethod(MethodHookParam p) {
+                if (!cMomentsRaw || logged >= 20) return;
+                try {
+                    Object a0 = p.args[0];
+                    String path = a0 instanceof File ? ((File) a0).getAbsolutePath()
+                            : (a0 instanceof String ? (String) a0 : null);
+                    if (path == null || !isMomentsFile(path)) return;
+                    if (seen.contains(path)) return;
+                    seen.add(path);
+                    logged++;
+                    StringBuilder sb = new StringBuilder();
+                    for (StackTraceElement e : new Throwable().getStackTrace()) {
+                        if (sb.length() < 3000) sb.append("\n    ").append(e.getClassName()).append('.').append(e.getMethodName());
+                        else break;
+                    }
+                    log("★ [朋友圈RandomAccessFile探测] path=" + path + " 调用栈(top→底):" + sb);
+                } catch (Throwable ignored) {
+                }
+            }
+        };
+        try { XposedHelpers.findAndHookConstructor(RandomAccessFile.class, File.class, String.class, logRaf); }
+        catch (Throwable t) { log("hook RAF(File,mode) 失败: " + t); }
+        try { XposedHelpers.findAndHookConstructor(RandomAccessFile.class, String.class, String.class, logRaf); }
+        catch (Throwable t) { log("hook RAF(String,mode) 失败: " + t); }
+
         try {
             XposedHelpers.findAndHookMethod(android.graphics.BitmapFactory.class, "decodeFile",
                     String.class, new XC_MethodHook() {
@@ -410,19 +436,13 @@ public class MainHook implements IXposedHookLoadPackage {
                             if (!cMomentsRaw || logged >= 30) return;
                             try {
                                 String path = (String) p.args[0];
-                                if (path == null) return;
-                                if (!path.contains("/MicroMsg/")) return;
-                                String low = path.toLowerCase(Locale.US);
-                                if (!(low.contains("pre_temp") || low.contains("/draft/")
-                                        || low.contains("sns"))) return;
-                                StackTraceElement[] st = new Throwable().getStackTrace();
-                                String key = st.length > 4 ? (st[4].getClassName() + "." + st[4].getMethodName()) : path;
-                                if (seen.contains(key)) return;
-                                seen.add(key);
+                                if (path == null || !isMomentsFile(path)) return;
+                                if (seen.contains(path)) return;
+                                seen.add(path);
                                 logged++;
                                 StringBuilder sb = new StringBuilder();
-                                for (StackTraceElement e : st) {
-                                    if (sb.length() < 1800) sb.append("\n    ").append(e.getClassName()).append('.').append(e.getMethodName());
+                                for (StackTraceElement e : new Throwable().getStackTrace()) {
+                                    if (sb.length() < 3000) sb.append("\n    ").append(e.getClassName()).append('.').append(e.getMethodName());
                                     else break;
                                 }
                                 log("★ [朋友圈读探测] path=" + path + " 调用栈(top→底):" + sb);
@@ -432,7 +452,73 @@ public class MainHook implements IXposedHookLoadPackage {
                     });
         } catch (Throwable t) { log("hook BitmapFactory.decodeFile 失败: " + t); }
 
-        log("已挂载朋友圈文件读写探针（开启「朋友圈上传原图」后，发朋友圈可抓压缩/读取栈）");
+        log("已挂载朋友圈文件读写探针(v7.6: 命中即报路径+大小+完整栈；发朋友圈并点发表后可抓压缩/读取栈)");
+    }
+
+    /** 是否朋友圈相关图片文件：MicroMsg 目录下、命中草稿/临时/上传目录或图片扩展名（排除 db/ini） */
+    private static boolean isMomentsFile(String path) {
+        if (path == null || !path.contains("/MicroMsg/")) return false;
+        String low = path.toLowerCase(Locale.US);
+        if (low.endsWith(".ini") || low.endsWith(".db") || low.endsWith(".db-wal")
+                || low.endsWith(".db-shm") || low.endsWith(".xml")) return false;
+        return low.contains("pre_temp") || low.contains("/draft/") || low.contains("sns")
+                || low.endsWith(".jpg") || low.endsWith(".jpeg") || low.endsWith(".png")
+                || low.endsWith(".webp");
+    }
+
+    private static long safeSize(String path) {
+        try { return new File(path).length(); } catch (Throwable t) { return -1L; }
+    }
+
+    /**
+     * 捕获相册选中的「原图」路径（只读，存入会话列表 sSelectedPaths）。
+     * 朋友圈真正的画质入口是「压缩源文件路径」——复制法需要把上传临时文件替换成这张原图。
+     * 这里在 Intent.putExtra(String, 路径列表) 时记下图片/视频路径，供下一版(复制法)使用，
+     * 也便于本次日志直接看到「用户选的原图」与「微信压缩写出的临时文件」的对应关系。
+     * 开关关闭时零开销。
+     */
+    private void installPathCapture() {
+        XC_MethodHook cap = new XC_MethodHook() {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam p) {
+                if (!cMomentsRaw) return;
+                try {
+                    String k = (String) p.args[0];
+                    if (k == null) return;
+                    String kl = k.toLowerCase(Locale.US);
+                    if (!(kl.contains("path") || kl.contains("media") || kl.contains("image")
+                            || kl.contains("sns") || kl.contains("select"))) return;
+                    Object v = p.args[1];
+                    if (v instanceof ArrayList) {
+                        for (Object o : (ArrayList<?>) v) if (o instanceof String) addSelected((String) o);
+                    } else if (v instanceof String[]) {
+                        for (String s : (String[]) v) if (s != null) addSelected(s);
+                    } else if (v instanceof String) {
+                        addSelected((String) v);
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+        };
+        try { XposedHelpers.findAndHookMethod(Intent.class, "putExtra", String.class, ArrayList.class, cap); }
+        catch (Throwable t) { log("hook putExtra(ArrayList) 失败: " + t); }
+        try { XposedHelpers.findAndHookMethod(Intent.class, "putExtra", String.class, String[].class, cap); }
+        catch (Throwable t) { log("hook putExtra(String[]) 失败: " + t); }
+        try { XposedHelpers.findAndHookMethod(Intent.class, "putExtra", String.class, String.class, cap); }
+        catch (Throwable t) { log("hook putExtra(String) 失败: " + t); }
+        log("已挂载相册选中原图路径捕获（朋友圈上传原图开启时生效）");
+    }
+
+    private static void addSelected(String s) {
+        if (s == null || s.length() < 4) return;
+        String low = s.toLowerCase(Locale.US);
+        if (low.endsWith(".jpg") || low.endsWith(".jpeg") || low.endsWith(".png")
+                || low.endsWith(".webp") || low.endsWith(".mp4") || low.endsWith(".mov")) {
+            synchronized (sSelectedPaths) {
+                if (!sSelectedPaths.contains(s)) sSelectedPaths.add(s);
+                if (sSelectedPaths.size() > 30) sSelectedPaths.remove(0);
+            }
+        }
     }
 
     private static void onResume(final Activity act) {
@@ -459,6 +545,11 @@ public class MainHook implements IXposedHookLoadPackage {
             log("★ 朋友圈发布界面：已抓取该界面全部 Intent extras（见上方）。");
             log("  诊断已落盘——请在本界面停留约 1 秒，再回 App「导出日志」即可拿到完整抓取。");
             log("  如需 View 树，请开启「详细日志」后重新进入本界面。");
+            StringBuilder ps = new StringBuilder("★ 本次会话已捕获原图路径(" + sSelectedPaths.size() + "):");
+            synchronized (sSelectedPaths) {
+                for (String s : sSelectedPaths) ps.append("\n    ").append(s);
+            }
+            log(ps.toString());
         }
 
         if (!cVerbose) {
