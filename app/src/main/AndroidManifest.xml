@@ -1,9 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!-- 模块首页需要读取落盘的调试日志 -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+
     <application
         android:allowBackup="true"
         android:label="WechatLive"
+        android:requestLegacyExternalStorage="true"
         android:supportsRtl="true">
 
         <activity
@@ -26,7 +31,7 @@
         <meta-data
             android:name="xposeddescription"
             android:value="微信发图默认实况(LivePhoto)+原图" />
-        <!-- 静态作用域：安装后 LSPosed 会自动推荐/勾选 com.tencent.mm -->
+        <!-- 静态作用域：微信 + 自身（自身用于首页激活自检） -->
         <meta-data
             android:name="xposedscope"
             android:resource="@array/xposed_scope" />

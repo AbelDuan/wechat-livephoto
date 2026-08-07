@@ -1,6 +1,9 @@
 package com.abel.wechatlive;
 
 import android.app.Activity;
+import android.app.AndroidAppHelper;
+import android.content.Context;
+import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
@@ -8,45 +11,58 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.widget.TextView;
 
+import java.io.File;
+import java.io.FileWriter;
 import java.lang.reflect.Field;
+import java.text.SimpleDateFormat;
+import java.util.Date;
 import java.util.HashSet;
+import java.util.Locale;
 import java.util.Set;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
+import de.robv.android.xposed.IXposedHookZygoteInit;
 import de.robv.android.xposed.XC_MethodHook;
+import de.robv.android.xposed.XC_MethodReplacement;
 import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
- * WechatLive - 微信发图默认「实况(LivePhoto) + 原图」
+ * WechatLive v3 - 微信发图默认「实况(LivePhoto) + 原图」
  *
- * ════════ 为什么上一版「启用后没作用」 ════════
- * 1) XposedBridge.log 只进 LSPosed 日志页，adb logcat -s WCLP 抓不到 → 看起来毫无输出。
- *    本版所有日志同时走 android.util.Log(TAG=WCLP)，logcat 能直接抓。
- * 2) 上一版只 hook 了 4 个「猜」出来的相册 Activity 类名，微信 8.0.76 实际类名大概率不同，
- *    4 个 hook 全部抛异常 → 什么都没发生，且你看不到任何失败提示。
- *    本版改为 hook 框架层 android.app.Activity#onResume，微信进程里**任何** Activity
- *    都会被记录，真实类名一目了然。
- * 3) 没有 android:label / 没有 launcher Activity，LSPosed 列表里辨识困难。本版已补。
+ * ════════ v2「启用后没作用、logcat 也没输出」的排查结论 ════════
+ * A) 【已确认的构建缺陷】AGP 在 minSdk>=21 的 debug 构建下按类分 dex，
+ *    v2 的 APK 里 classes.dex 只有 R 类，MainHook 被丢进 classes2.dex。
+ *    部分 LSPosed/Xposed 实现加载模块时只扫主 dex → 入口类 ClassNotFound
+ *    → 模块静默加载失败，既不生效也没有任何日志。
+ *    修复：gradle.properties 关闭 dexing artifact transform + multiDexEnabled false。
+ * B) 【调试通道太脆弱】不少国产 ROM 默认压制第三方应用的 logcat 输出，
+ *    "没有日志"无法区分"模块没跑"和"日志被吞"。
+ *    修复：三重输出 —— logcat(TAG=WCLP) + XposedBridge 日志页 + 落盘文件。
+ * C) 【缺少自检】没法在不接电脑的情况下判断模块到底激活没有。
+ *    修复：作用域加入模块自身，hook MainActivity#isModuleActive 返回 true，
+ *    打开 WechatLive 首页即可一眼看到激活状态。
  *
- * ════════ 分三阶段调试 ════════
- * 阶段 1（当前默认）：LOG_ACTIVITY + DUMP_VIEWS
- *   打开相册 → logcat 抓 WCLP → 得到真实 Activity 类名 + 完整 View 树
- *   （含每个 View 的 id / clickable / selected / activated / desc / text）
- *   「实况」按钮的选中状态极可能就体现在 selected 或 activated 上——
- *   那样就能直接判断是否已勾选，比像素比对可靠得多。
- * 阶段 2：PROBE=true，扫描该 Activity 内部 boolean 字段，定位混淆后的
- *   「实况 / 原图」开关字段名。
- * 阶段 3：DO_FORCE=true + FORCE_FIELDS 填入字段名 → 源头默认全开，
+ * ════════ 分三阶段推进 ════════
+ * 阶段 1（当前）：LOG_ACTIVITY + DUMP_VIEWS
+ *   打开相册 → 拿到真实 Activity 类名 + 完整 View 树
+ *   （每个 View 的 id / clickable / selected / activated / desc / text）
+ *   「实况」选中态很可能就落在 selected 或 activated 上 → 得到可靠的已勾选判断依据。
+ * 阶段 2：PROBE=true，扫 Activity 内部 boolean 字段，定位混淆后的实况/原图开关。
+ * 阶段 3：DO_FORCE=true + FORCE_FIELDS 填字段名 → 源头默认全开，
  *   缩略图多选直接发送即为实况+原图，无需任何点击。
  */
-public class MainHook implements IXposedHookLoadPackage {
+public class MainHook implements IXposedHookLoadPackage, IXposedHookZygoteInit {
 
     private static final String TAG = "WCLP";
     private static final String WECHAT_PKG = "com.tencent.mm";
+    private static final String SELF_PKG = "com.abel.wechatlive";
 
-    // ══════════ 开关 ══════════
+    /** 日志文件名；写到 /sdcard 根与 Download 下，模块首页会直接读出来展示 */
+    private static final String LOG_NAME = "WechatLive.log";
+
+    // ══════════ 阶段开关 ══════════
     /** 记录微信进程内每个 Activity 的 onResume（找真实相册类名） */
     private static final boolean LOG_ACTIVITY = true;
     /** 命中相册类名时打印完整 View 树（找实况按钮及其状态属性） */
@@ -61,7 +77,7 @@ public class MainHook implements IXposedHookLoadPackage {
     /** 阶段 3 用：确认后的混淆字段名 */
     private static final Set<String> FORCE_FIELDS = new HashSet<>();
 
-    /** Activity 类名（小写）包含任一关键字才视为相册相关，避免刷屏 */
+    /** Activity 类名（小写）含任一关键字才视为相册相关，避免刷屏 */
     private static final String[] GALLERY_HINTS = {
             "gallery", "album", "image", "picture", "photo", "media", "preview"
     };
@@ -70,26 +86,98 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final String LIVE_VID = "uzc";
     private static final String LIVE_TEXT = "实况";
 
+    private static final SimpleDateFormat TS =
+            new SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.US);
+
     private final Handler handler = new Handler(Looper.getMainLooper());
 
-    // ══════════ 日志：双写，logcat 与 LSPosed 日志页都能看到 ══════════
+    // ══════════════════ 日志：logcat + Xposed 日志页 + 文件，三重保险 ══════════════════
     private static void log(String msg) {
         Log.i(TAG, msg);
         try {
             XposedBridge.log(TAG + ": " + msg);
         } catch (Throwable ignored) {
         }
+        writeFile(msg);
     }
 
+    /** 依次尝试多个可写位置，任一成功即可；全失败就只剩 logcat */
+    private static void writeFile(String msg) {
+        String line = TS.format(new Date()) + "  " + msg + "\n";
+        File[] candidates = logFiles();
+        for (File f : candidates) {
+            if (f == null) continue;
+            FileWriter w = null;
+            try {
+                File dir = f.getParentFile();
+                if (dir != null && !dir.exists()) dir.mkdirs();
+                w = new FileWriter(f, true);
+                w.write(line);
+                w.flush();
+                return; // 写成功一个就够
+            } catch (Throwable ignored) {
+            } finally {
+                if (w != null) {
+                    try {
+                        w.close();
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+        }
+    }
+
+    static File[] logFiles() {
+        File ext = null, dl = null, priv = null;
+        try {
+            ext = new File(Environment.getExternalStorageDirectory(), LOG_NAME);
+        } catch (Throwable ignored) {
+        }
+        try {
+            dl = new File(Environment.getExternalStoragePublicDirectory(
+                    Environment.DIRECTORY_DOWNLOADS), LOG_NAME);
+        } catch (Throwable ignored) {
+        }
+        try {
+            Context c = AndroidAppHelper.currentApplication();
+            if (c != null) priv = new File(c.getFilesDir(), LOG_NAME);
+        } catch (Throwable ignored) {
+        }
+        return new File[]{ext, dl, priv};
+    }
+
+    // ══════════════════ Zygote 阶段：证明模块本体已被框架加载 ══════════════════
+    @Override
+    public void initZygote(StartupParam startupParam) {
+        // 这一行只要出现，就说明模块 APK 与入口类被 LSPosed 成功加载（排除 dex/入口问题）
+        log("=== WechatLive v3 loaded === modulePath=" + startupParam.modulePath
+                + " startsSystemServer=" + startupParam.startsSystemServer);
+    }
+
+    // ══════════════════ 每个作用域内应用启动时 ══════════════════
     @Override
     public void handleLoadPackage(final XC_LoadPackage.LoadPackageParam lpparam) {
+        // ① 自身进程：让首页自检能显示"已激活"
+        if (SELF_PKG.equals(lpparam.packageName)) {
+            try {
+                XposedHelpers.findAndHookMethod(SELF_PKG + ".MainActivity",
+                        lpparam.classLoader, "isModuleActive",
+                        XC_MethodReplacement.returnConstant(true));
+                log("self-check hook installed");
+            } catch (Throwable t) {
+                log("self-check hook failed: " + t);
+            }
+            return;
+        }
+
+        // ② 目标：微信
         if (!WECHAT_PKG.equals(lpparam.packageName)) return;
 
-        // ★ 只要能在 logcat 看到这一行，就说明模块已成功注入微信进程
+        // ★ 看到这一行 = 已成功注入微信进程
         log("=== WechatLive injected === pkg=" + lpparam.packageName
                 + " process=" + lpparam.processName);
 
-        // hook 框架层 Activity#onResume：微信进程内所有 Activity 通吃，不用猜类名
+        // hook 框架层 Activity#onResume：微信所有进程、所有 Activity 通吃，不用猜类名
         try {
             XposedHelpers.findAndHookMethod(Activity.class, "onResume", new XC_MethodHook() {
                 @Override
@@ -108,14 +196,14 @@ public class MainHook implements IXposedHookLoadPackage {
                     }
                 }
             });
-            log("hook android.app.Activity#onResume OK");
+            log("hook android.app.Activity#onResume OK  [" + lpparam.processName + "]");
         } catch (Throwable t) {
             log("hook android.app.Activity#onResume FAILED: " + t);
         }
     }
 
     private boolean isGalleryLike(String className) {
-        String lc = className.toLowerCase();
+        String lc = className.toLowerCase(Locale.US);
         for (String h : GALLERY_HINTS) {
             if (lc.contains(h)) return true;
         }
@@ -132,8 +220,7 @@ public class MainHook implements IXposedHookLoadPackage {
                 if (DUMP_VIEWS) {
                     try {
                         log("---- VIEW TREE of " + cn + " ----");
-                        View root = activity.getWindow().getDecorView();
-                        dumpView(root, 0);
+                        dumpView(activity.getWindow().getDecorView(), 0);
                         log("---- VIEW TREE END ----");
                     } catch (Throwable t) {
                         log("dumpView error: " + t);
@@ -157,7 +244,7 @@ public class MainHook implements IXposedHookLoadPackage {
         }, 600);
     }
 
-    // ══════════ View 树 dump：找「实况」按钮 & 它的选中状态载体 ══════════
+    // ══════════════════ View 树 dump：找「实况」按钮 & 其选中状态载体 ══════════════════
     private void dumpView(View v, int depth) {
         if (v == null || depth > 14) return;
 
@@ -204,7 +291,7 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    // ══════════ 阶段 2/3：反射扫描 / 强制内部 boolean 字段 ══════════
+    // ══════════════════ 阶段 2/3：反射扫描 / 强制内部 boolean 字段 ══════════════════
     private void applyForce(Object target, int depth) {
         if (target == null || depth > 2) return;
         Class<?> c = target.getClass();
@@ -235,7 +322,7 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    // ══════════ 点按兜底 ══════════
+    // ══════════════════ 点按兜底 ══════════════════
     private void autoCheckLive(Activity activity) {
         View root = activity.getWindow().getDecorView();
         if (root == null) return;

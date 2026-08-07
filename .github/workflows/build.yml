@@ -25,6 +25,24 @@ jobs:
           build-root-directory: .
           arguments: :app:assembleDebug
 
+      # LSPosed 部分实现加载模块只扫主 dex，入口类必须在 classes.dex 里。
+      # 出现 classes2.dex 就直接让构建失败，避免又产出一个"装了没反应"的包。
+      - name: Verify single-dex & entry class
+        run: |
+          APK=$(ls app/build/outputs/apk/debug/*.apk | head -1)
+          echo "APK = $APK"
+          unzip -l "$APK" | grep -E 'classes[0-9]*\.dex|assets/xposed'
+          if unzip -l "$APK" | grep -q 'classes2.dex'; then
+            echo "::error::APK 被拆成多个 dex，入口类可能不在主 dex，LSPosed 会加载失败"
+            exit 1
+          fi
+          unzip -p "$APK" classes.dex > /tmp/c.dex
+          if ! grep -q 'com/abel/wechatlive/MainHook' /tmp/c.dex; then
+            echo "::error::主 dex 中找不到 MainHook 入口类"
+            exit 1
+          fi
+          echo "OK: 单 dex，且 MainHook 在主 dex 中"
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:

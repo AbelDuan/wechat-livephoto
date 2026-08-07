@@ -1,7 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- LSPosed 静态作用域：只作用于微信 -->
+    <!-- LSPosed 静态作用域 -->
     <string-array name="xposed_scope">
+        <!-- 目标：微信 -->
         <item>com.tencent.mm</item>
+        <!-- 自身：勾上后模块首页才能自检"是否已激活" -->
+        <item>com.abel.wechatlive</item>
     </string-array>
 </resources>

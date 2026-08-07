@@ -5,9 +5,12 @@ android {
     defaultConfig {
         applicationId "com.abel.wechatlive"
         minSdkVersion 24
-        targetSdkVersion 33
-        versionCode 2
-        versionName "2.0"
+        // 模块自身页面需要直读 /sdcard 上的日志文件，targetSdk 28 保留旧版存储语义
+        targetSdkVersion 28
+        versionCode 3
+        versionName "3.0"
+        // 必须单 dex：见 gradle.properties 说明
+        multiDexEnabled false
     }
     buildTypes {
         release {
