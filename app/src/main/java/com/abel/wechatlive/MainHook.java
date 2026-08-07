@@ -1,363 +1,389 @@
 package com.abel.wechatlive;
 
 import android.app.Activity;
-import android.app.AndroidAppHelper;
 import android.content.Context;
-import android.os.Environment;
+import android.net.Uri;
+import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
-import android.util.Log;
+import android.text.TextUtils;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.TextView;
 
-import java.io.File;
-import java.io.FileWriter;
-import java.lang.reflect.Field;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Date;
-import java.util.HashSet;
+import java.util.List;
 import java.util.Locale;
-import java.util.Set;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
-import de.robv.android.xposed.IXposedHookZygoteInit;
 import de.robv.android.xposed.XC_MethodHook;
-import de.robv.android.xposed.XC_MethodReplacement;
 import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
- * WechatLive v3 - 微信发图默认「实况(LivePhoto) + 原图」
+ * 运行在微信进程内的 Hook 主体。
  *
- * ════════ v2「启用后没作用、logcat 也没输出」的排查结论 ════════
- * A) 【已确认的构建缺陷】AGP 在 minSdk>=21 的 debug 构建下按类分 dex，
- *    v2 的 APK 里 classes.dex 只有 R 类，MainHook 被丢进 classes2.dex。
- *    部分 LSPosed/Xposed 实现加载模块时只扫主 dex → 入口类 ClassNotFound
- *    → 模块静默加载失败，既不生效也没有任何日志。
- *    修复：gradle.properties 关闭 dexing artifact transform + multiDexEnabled false。
- * B) 【调试通道太脆弱】不少国产 ROM 默认压制第三方应用的 logcat 输出，
- *    "没有日志"无法区分"模块没跑"和"日志被吞"。
- *    修复：三重输出 —— logcat(TAG=WCLP) + XposedBridge 日志页 + 落盘文件。
- * C) 【缺少自检】没法在不接电脑的情况下判断模块到底激活没有。
- *    修复：作用域加入模块自身，hook MainActivity#isModuleActive 返回 true，
- *    打开 WechatLive 首页即可一眼看到激活状态。
+ * 这是整个工程里**唯一**允许出现 de.robv.android.xposed.* 的文件。
+ * 模块 App 的 UI 代码绝不能引用本类（否则 App 进程加载不到 XposedBridge → 闪退）。
  *
- * ════════ 分三阶段推进 ════════
- * 阶段 1（当前）：LOG_ACTIVITY + DUMP_VIEWS
- *   打开相册 → 拿到真实 Activity 类名 + 完整 View 树
- *   （每个 View 的 id / clickable / selected / activated / desc / text）
- *   「实况」选中态很可能就落在 selected 或 activated 上 → 得到可靠的已勾选判断依据。
- * 阶段 2：PROBE=true，扫 Activity 内部 boolean 字段，定位混淆后的实况/原图开关。
- * 阶段 3：DO_FORCE=true + FORCE_FIELDS 填字段名 → 源头默认全开，
- *   缩略图多选直接发送即为实况+原图，无需任何点击。
+ * 设计要点：
+ *  1. 只 hook 框架层 android.app.Activity#onResume —— 不猜微信的混淆类名，
+ *     任何 Activity 进前台都能拿到真实类名。
+ *  2. 每次 onResume 通过 ContentProvider 向模块 App 回报心跳 + 日志，
+ *     并同步取回用户在 App 里勾的开关（启用/暂停实时生效）。
+ *  3. 「原图」有 contentDescription（含"已选中/未选中"），可确定性判断与勾选；
+ *     「实况」无 text/desc，先把 isSelected/isActivated/tag 全打出来，
+ *     确认哪个属性能表达勾选态，再决定强制策略。
  */
-public class MainHook implements IXposedHookLoadPackage, IXposedHookZygoteInit {
+public class MainHook implements IXposedHookLoadPackage {
 
     private static final String TAG = "WCLP";
-    private static final String WECHAT_PKG = "com.tencent.mm";
-    private static final String SELF_PKG = "com.abel.wechatlive";
+    private static final String URI_STR = Const.URI;
 
-    /** 日志文件名；写到 /sdcard 根与 Download 下，模块首页会直接读出来展示 */
-    private static final String LOG_NAME = "WechatLive.log";
-
-    // ══════════ 阶段开关 ══════════
-    /** 记录微信进程内每个 Activity 的 onResume（找真实相册类名） */
-    private static final boolean LOG_ACTIVITY = true;
-    /** 命中相册类名时打印完整 View 树（找实况按钮及其状态属性） */
-    private static final boolean DUMP_VIEWS = true;
-    /** 扫描并打印 Activity 内部 boolean 字段（量大，阶段 2 再开） */
-    private static final boolean PROBE = false;
-    /** 把 FORCE_FIELDS 中的字段强制 true（阶段 3） */
-    private static final boolean DO_FORCE = false;
-    /** 点按兜底：在界面上模拟点一下「实况」开关 */
-    private static final boolean CLICK_FALLBACK = false;
-
-    /** 阶段 3 用：确认后的混淆字段名 */
-    private static final Set<String> FORCE_FIELDS = new HashSet<>();
-
-    /** Activity 类名（小写）含任一关键字才视为相册相关，避免刷屏 */
-    private static final String[] GALLERY_HINTS = {
-            "gallery", "album", "image", "picture", "photo", "media", "preview"
-    };
-
-    // 点击兜底用
-    private static final String LIVE_VID = "uzc";
-    private static final String LIVE_TEXT = "实况";
-
+    private static final Handler H = new Handler(Looper.getMainLooper());
+    private static final List<String> PENDING = new ArrayList<String>();
     private static final SimpleDateFormat TS =
-            new SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.US);
+            new SimpleDateFormat("HH:mm:ss.SSS", Locale.US);
 
-    private final Handler handler = new Handler(Looper.getMainLooper());
+    private static String sProc = "?";
+    private static long sLastReport = 0L;
 
-    // ══════════════════ 日志：logcat + Xposed 日志页 + 文件，三重保险 ══════════════════
-    private static void log(String msg) {
-        Log.i(TAG, msg);
-        try {
-            XposedBridge.log(TAG + ": " + msg);
-        } catch (Throwable ignored) {
-        }
-        writeFile(msg);
-    }
+    // 用户开关（默认全开，取不到配置时按默认走）
+    private static volatile boolean cEnabled = true;
+    private static volatile boolean cLive = true;
+    private static volatile boolean cOrig = true;
+    private static volatile boolean cVerbose = true;
 
-    /** 依次尝试多个可写位置，任一成功即可；全失败就只剩 logcat */
-    private static void writeFile(String msg) {
-        String line = TS.format(new Date()) + "  " + msg + "\n";
-        File[] candidates = logFiles();
-        for (File f : candidates) {
-            if (f == null) continue;
-            FileWriter w = null;
-            try {
-                File dir = f.getParentFile();
-                if (dir != null && !dir.exists()) dir.mkdirs();
-                w = new FileWriter(f, true);
-                w.write(line);
-                w.flush();
-                return; // 写成功一个就够
-            } catch (Throwable ignored) {
-            } finally {
-                if (w != null) {
-                    try {
-                        w.close();
-                    } catch (Throwable ignored) {
-                    }
-                }
-            }
-        }
-    }
-
-    static File[] logFiles() {
-        File ext = null, dl = null, priv = null;
-        try {
-            ext = new File(Environment.getExternalStorageDirectory(), LOG_NAME);
-        } catch (Throwable ignored) {
-        }
-        try {
-            dl = new File(Environment.getExternalStoragePublicDirectory(
-                    Environment.DIRECTORY_DOWNLOADS), LOG_NAME);
-        } catch (Throwable ignored) {
-        }
-        try {
-            Context c = AndroidAppHelper.currentApplication();
-            if (c != null) priv = new File(c.getFilesDir(), LOG_NAME);
-        } catch (Throwable ignored) {
-        }
-        return new File[]{ext, dl, priv};
-    }
-
-    // ══════════════════ Zygote 阶段：证明模块本体已被框架加载 ══════════════════
     @Override
-    public void initZygote(StartupParam startupParam) {
-        // 这一行只要出现，就说明模块 APK 与入口类被 LSPosed 成功加载（排除 dex/入口问题）
-        log("=== WechatLive v3 loaded === modulePath=" + startupParam.modulePath
-                + " startsSystemServer=" + startupParam.startsSystemServer);
-    }
+    public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lp) {
+        if (!Const.WECHAT_PKG.equals(lp.packageName)) return;
+        sProc = lp.processName;
+        log("========================================");
+        log("WechatLive v4 注入成功  proc=" + sProc);
 
-    // ══════════════════ 每个作用域内应用启动时 ══════════════════
-    @Override
-    public void handleLoadPackage(final XC_LoadPackage.LoadPackageParam lpparam) {
-        // ① 自身进程：让首页自检能显示"已激活"
-        if (SELF_PKG.equals(lpparam.packageName)) {
-            try {
-                XposedHelpers.findAndHookMethod(SELF_PKG + ".MainActivity",
-                        lpparam.classLoader, "isModuleActive",
-                        XC_MethodReplacement.returnConstant(true));
-                log("self-check hook installed");
-            } catch (Throwable t) {
-                log("self-check hook failed: " + t);
-            }
-            return;
-        }
-
-        // ② 目标：微信
-        if (!WECHAT_PKG.equals(lpparam.packageName)) return;
-
-        // ★ 看到这一行 = 已成功注入微信进程
-        log("=== WechatLive injected === pkg=" + lpparam.packageName
-                + " process=" + lpparam.processName);
-
-        // hook 框架层 Activity#onResume：微信所有进程、所有 Activity 通吃，不用猜类名
         try {
             XposedHelpers.findAndHookMethod(Activity.class, "onResume", new XC_MethodHook() {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
                     try {
-                        Activity act = (Activity) param.thisObject;
-                        String cn = act.getClass().getName();
-                        if (LOG_ACTIVITY) {
-                            log("onResume [" + lpparam.processName + "] " + cn);
-                        }
-                        if (isGalleryLike(cn)) {
-                            onGallery(act, cn);
-                        }
+                        onResume((Activity) param.thisObject);
                     } catch (Throwable t) {
                         log("onResume handler error: " + t);
                     }
                 }
             });
-            log("hook android.app.Activity#onResume OK  [" + lpparam.processName + "]");
+            log("已挂载 Activity#onResume");
         } catch (Throwable t) {
-            log("hook android.app.Activity#onResume FAILED: " + t);
+            log("挂载 Activity#onResume 失败: " + t);
         }
     }
 
-    private boolean isGalleryLike(String className) {
-        String lc = className.toLowerCase(Locale.US);
-        for (String h : GALLERY_HINTS) {
-            if (lc.contains(h)) return true;
-        }
-        return false;
-    }
+    // ────────────────────────────── 生命周期 ──────────────────────────────
 
-    private void onGallery(final Activity activity, final String cn) {
-        log(">>> GALLERY-LIKE ACTIVITY: " + cn);
+    private static void onResume(final Activity act) {
+        if (act == null) return;
+        final String cls = act.getClass().getName();
+        log("onResume [" + sProc + "] " + cls);
 
-        // 延迟一点，等 View 树 / 内部状态初始化完成
-        handler.postDelayed(new Runnable() {
+        // 心跳 + 拉取开关（后台线程，避免阻塞微信主线程）
+        report(act.getApplicationContext(), cls);
+
+        if (!cEnabled) return;
+        if (!looksLikeGallery(cls)) return;
+
+        // 相册界面：延迟两次扫描，兼顾"控件还没 inflate 完"的情况
+        H.postDelayed(new Runnable() {
             @Override
             public void run() {
-                if (DUMP_VIEWS) {
-                    try {
-                        log("---- VIEW TREE of " + cn + " ----");
-                        dumpView(activity.getWindow().getDecorView(), 0);
-                        log("---- VIEW TREE END ----");
-                    } catch (Throwable t) {
-                        log("dumpView error: " + t);
-                    }
+                scan(act, cls, 1);
+            }
+        }, 600);
+        H.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                scan(act, cls, 2);
+            }
+        }, 1800);
+    }
+
+    private static boolean looksLikeGallery(String cls) {
+        String s = cls.toLowerCase(Locale.US);
+        return s.contains("gallery") || s.contains("album") || s.contains("preview")
+                || s.contains("image") || s.contains("photo") || s.contains("media")
+                || s.contains("pic") || s.contains("select");
+    }
+
+    // ────────────────────────────── 扫描 / 操作 ──────────────────────────────
+
+    private static void scan(Activity act, String cls, int pass) {
+        try {
+            if (act.isFinishing()) return;
+            View root = act.getWindow().getDecorView();
+            if (root == null) return;
+
+            if (cVerbose && pass == 1) {
+                log("──── VIEW TREE  " + cls + " ────");
+                dump(root, 0, new int[]{0});
+                log("──── END TREE ────");
+            }
+
+            List<View> all = new ArrayList<View>();
+            collect(root, all);
+
+            if (cOrig) handleOriginal(all, pass);
+            if (cLive) handleLive(all, pass);
+
+            report(act.getApplicationContext(), cls);
+        } catch (Throwable t) {
+            log("scan error(pass" + pass + "): " + t);
+        }
+    }
+
+    /**
+     * 「原图」是可确定性判断的：ImageView 的 contentDescription 形如
+     *   "未选中,原图,复选框" / "已选中,原图,复选框"
+     * 所以只在"未选中"时点一次，天然幂等、不会来回切。
+     */
+    private static void handleOriginal(List<View> all, int pass) {
+        for (View v : all) {
+            CharSequence d = v.getContentDescription();
+            if (d == null) continue;
+            String s = d.toString();
+            if (!s.contains("原图")) continue;
+            log("[原图] " + brief(v) + " desc=" + s);
+            if (s.contains("未选中")) {
+                View target = clickable(v);
+                if (target != null) {
+                    boolean ok = target.performClick();
+                    log("[原图] performClick -> " + ok + " (pass" + pass + ")");
+                } else {
+                    log("[原图] 找不到可点击容器");
                 }
-                if (PROBE || DO_FORCE) {
-                    try {
-                        applyForce(activity, 0);
-                    } catch (Throwable t) {
-                        log("applyForce error: " + t);
-                    }
-                }
-                if (CLICK_FALLBACK) {
-                    try {
-                        autoCheckLive(activity);
-                    } catch (Throwable t) {
-                        log("clickFallback error: " + t);
+            }
+            return;
+        }
+        if (pass == 1) log("[原图] 本页未找到（正常：仅预览页有）");
+    }
+
+    /**
+     * 「实况」在无障碍树里没有 text/desc，勾选态藏在别处。
+     * 这里把所有可疑属性全打出来，等日志回来确认哪一个能表达状态。
+     * 在确认之前，只有当 selected/activated 都为 false 时才点一次，避免反复切换。
+     */
+    private static void handleLive(List<View> all, int pass) {
+        View hit = null;
+        String how = null;
+
+        for (View v : all) {
+            String idn = idName(v);
+            if ("uzc".equals(idn)) {
+                hit = v;
+                how = "id=uzc";
+                break;
+            }
+        }
+        if (hit == null) {
+            for (View v : all) {
+                if (v instanceof TextView) {
+                    CharSequence t = ((TextView) v).getText();
+                    if (t != null && "实况".contentEquals(t)) {
+                        hit = v;
+                        how = "text=实况";
+                        break;
                     }
                 }
             }
-        }, 600);
-    }
-
-    // ══════════════════ View 树 dump：找「实况」按钮 & 其选中状态载体 ══════════════════
-    private void dumpView(View v, int depth) {
-        if (v == null || depth > 14) return;
-
-        String id = "-";
-        try {
-            int vid = v.getId();
-            if (vid != View.NO_ID) id = v.getResources().getResourceEntryName(vid);
-        } catch (Throwable ignored) {
+        }
+        if (hit == null) {
+            if (pass == 1) log("[实况] 本页未找到 uzc / 文字\"实况\"");
+            return;
         }
 
-        StringBuilder pad = new StringBuilder();
-        for (int i = 0; i < depth; i++) pad.append("| ");
+        log("[实况] 命中 " + how + " -> " + brief(hit));
+        View target = clickable(hit);
+        if (target == null) {
+            log("[实况] 找不到可点击容器");
+            return;
+        }
+        log("[实况] 容器 " + brief(target));
 
+        if (target.isSelected() || target.isActivated()) {
+            log("[实况] 已是 selected/activated，跳过点击");
+            return;
+        }
+        if (pass != 1) {
+            log("[实况] pass2 不重复点击，避免来回切换");
+            return;
+        }
+        boolean ok = target.performClick();
+        log("[实况] performClick -> " + ok
+                + "  点击后 sel=" + target.isSelected()
+                + " act=" + target.isActivated());
+    }
+
+    // ────────────────────────────── View 工具 ──────────────────────────────
+
+    private static void collect(View v, List<View> out) {
+        if (v == null || out.size() > 3000) return;
+        out.add(v);
+        if (v instanceof ViewGroup) {
+            ViewGroup g = (ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) {
+                collect(g.getChildAt(i), out);
+            }
+        }
+    }
+
+    private static void dump(View v, int depth, int[] count) {
+        if (v == null || depth > 30 || count[0] > 600) return;
+        count[0]++;
         StringBuilder sb = new StringBuilder();
-        sb.append("VIEW ").append(pad)
-                .append(v.getClass().getSimpleName())
-                .append(" id=").append(id)
-                .append(" clk=").append(v.isClickable() ? 1 : 0)
-                .append(" sel=").append(v.isSelected() ? 1 : 0)
-                .append(" act=").append(v.isActivated() ? 1 : 0)
-                .append(" en=").append(v.isEnabled() ? 1 : 0)
-                .append(" vis=").append(v.getVisibility() == View.VISIBLE ? "V" : "X");
+        for (int i = 0; i < depth; i++) sb.append("  ");
+        sb.append(brief(v));
+        log(sb.toString());
+        if (v instanceof ViewGroup) {
+            ViewGroup g = (ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) {
+                dump(g.getChildAt(i), depth + 1, count);
+            }
+        }
+    }
 
-        CharSequence cd = v.getContentDescription();
-        if (cd != null && cd.length() > 0) sb.append(" desc=\"").append(cd).append('"');
+    /** 一行摘要：类名 / id / 是否可点 / selected / activated / 可见 / desc / text / tag */
+    private static String brief(View v) {
+        StringBuilder sb = new StringBuilder();
+        sb.append(v.getClass().getSimpleName());
+        String idn = idName(v);
+        if (idn != null) sb.append(" id=").append(idn);
+        sb.append(" clk=").append(v.isClickable() ? 1 : 0);
+        sb.append(" sel=").append(v.isSelected() ? 1 : 0);
+        sb.append(" act=").append(v.isActivated() ? 1 : 0);
+        sb.append(" en=").append(v.isEnabled() ? 1 : 0);
+        sb.append(" vis=").append(v.getVisibility() == View.VISIBLE ? 1 : 0);
+        sb.append(" sz=").append(v.getWidth()).append('x').append(v.getHeight());
+        CharSequence d = v.getContentDescription();
+        if (!TextUtils.isEmpty(d)) sb.append(" desc=\"").append(d).append('"');
         if (v instanceof TextView) {
             CharSequence t = ((TextView) v).getText();
-            if (t != null && t.length() > 0) sb.append(" text=\"").append(t).append('"');
+            if (!TextUtils.isEmpty(t)) {
+                String s = t.toString();
+                if (s.length() > 24) s = s.substring(0, 24) + "…";
+                sb.append(" text=\"").append(s).append('"');
+            }
         }
         Object tag = null;
         try {
             tag = v.getTag();
         } catch (Throwable ignored) {
         }
-        if (tag != null) sb.append(" tag=").append(tag);
+        if (tag != null) {
+            String s = String.valueOf(tag);
+            if (s.length() > 40) s = s.substring(0, 40) + "…";
+            sb.append(" tag=").append(s);
+        }
+        return sb.toString();
+    }
 
-        log(sb.toString());
-
-        if (v instanceof ViewGroup) {
-            ViewGroup g = (ViewGroup) v;
-            for (int i = 0; i < g.getChildCount(); i++) {
-                dumpView(g.getChildAt(i), depth + 1);
-            }
+    private static String idName(View v) {
+        try {
+            int id = v.getId();
+            if (id == View.NO_ID) return null;
+            return v.getResources().getResourceEntryName(id);
+        } catch (Throwable t) {
+            return null;
         }
     }
 
-    // ══════════════════ 阶段 2/3：反射扫描 / 强制内部 boolean 字段 ══════════════════
-    private void applyForce(Object target, int depth) {
-        if (target == null || depth > 2) return;
-        Class<?> c = target.getClass();
-        while (c != null) {
-            String pn = c.getName();
-            if (!pn.startsWith("com.tencent.mm")) break;
-            for (Field f : c.getDeclaredFields()) {
-                Class<?> t = f.getType();
-                boolean isBool = (t == boolean.class || t == Boolean.class);
-                try {
-                    f.setAccessible(true);
-                    Object v = f.get(target);
-                    if (PROBE && isBool) {
-                        log("probe " + pn + "#" + f.getName() + " = " + v);
-                    }
-                    if (DO_FORCE && isBool && FORCE_FIELDS.contains(f.getName())) {
-                        f.set(target, true);
-                        log("FORCED " + pn + "#" + f.getName() + " = true");
-                    }
-                    if (depth < 2 && !isBool && v != null
-                            && v.getClass().getName().startsWith("com.tencent.mm")) {
-                        applyForce(v, depth + 1);
-                    }
-                } catch (Throwable ignored) {
-                }
-            }
-            c = c.getSuperclass();
-        }
-    }
-
-    // ══════════════════ 点按兜底 ══════════════════
-    private void autoCheckLive(Activity activity) {
-        View root = activity.getWindow().getDecorView();
-        if (root == null) return;
-
-        int vidId = activity.getResources().getIdentifier(LIVE_VID, "id", WECHAT_PKG);
-        if (vidId != 0) {
-            View v = root.findViewById(vidId);
-            if (v != null && v.isClickable() && !v.isSelected()) {
-                v.performClick();
-                log("click-checked via vid=" + LIVE_VID);
-                return;
-            }
-        }
-        View tv = findTextViewByText(root, LIVE_TEXT);
-        if (tv != null && tv.getParent() instanceof View) {
-            View parent = (View) tv.getParent();
-            if (parent.isClickable() && !parent.isSelected()) {
-                parent.performClick();
-                log("click-checked via text=" + LIVE_TEXT);
-            }
-        }
-    }
-
-    private View findTextViewByText(View root, String text) {
-        if (root instanceof TextView) {
-            CharSequence t = ((TextView) root).getText();
-            if (text.equals(String.valueOf(t))) return root;
-        }
-        if (root instanceof ViewGroup) {
-            ViewGroup vg = (ViewGroup) root;
-            for (int i = 0; i < vg.getChildCount(); i++) {
-                View r = findTextViewByText(vg.getChildAt(i), text);
-                if (r != null) return r;
-            }
+    /** 自身可点则返回自身，否则向上找最近的可点击祖先（最多 5 层） */
+    private static View clickable(View v) {
+        View cur = v;
+        for (int i = 0; i < 6 && cur != null; i++) {
+            if (cur.isClickable() && cur.isEnabled()) return cur;
+            if (!(cur.getParent() instanceof View)) break;
+            cur = (View) cur.getParent();
         }
         return null;
+    }
+
+    // ────────────────────────────── 日志 / 上报 ──────────────────────────────
+
+    private static void log(String msg) {
+        String line = TS.format(new Date()) + "  " + msg;
+        synchronized (PENDING) {
+            PENDING.add(line);
+            if (PENDING.size() > 2000) PENDING.remove(0);
+        }
+        try {
+            XposedBridge.log("[" + TAG + "] " + line);
+        } catch (Throwable ignored) {
+        }
+        try {
+            android.util.Log.i(TAG, line);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static String drain() {
+        synchronized (PENDING) {
+            if (PENDING.isEmpty()) return null;
+            StringBuilder sb = new StringBuilder();
+            for (String s : PENDING) sb.append(s).append('\n');
+            PENDING.clear();
+            return sb.toString();
+        }
+    }
+
+    /** 心跳上报 + 同步开关；放后台线程，避免在微信主线程做 Binder IPC */
+    private static void report(final Context ctx, final String activity) {
+        if (ctx == null) return;
+        long now = System.currentTimeMillis();
+        boolean hasLog;
+        synchronized (PENDING) {
+            hasLog = !PENDING.isEmpty();
+        }
+        if (!hasLog && now - sLastReport < 2000) return;
+        sLastReport = now;
+
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    Bundle in = new Bundle();
+                    in.putString(Const.K_LAST_ACT, activity);
+                    in.putString(Const.K_WX_VER, versionOf(ctx));
+                    String logs = drain();
+                    if (logs != null) in.putString(Const.KEY_LOG, logs);
+
+                    Bundle out = ctx.getContentResolver()
+                            .call(Uri.parse(URI_STR), Const.METHOD_REPORT, null, in);
+                    if (out != null) {
+                        cEnabled = out.getBoolean(Const.K_ENABLED, true);
+                        cLive = out.getBoolean(Const.K_LIVE, true);
+                        cOrig = out.getBoolean(Const.K_ORIG, true);
+                        cVerbose = out.getBoolean(Const.K_VERBOSE, true);
+                    } else {
+                        XposedBridge.log("[" + TAG + "] provider 返回 null，"
+                                + "模块 App 可能被冻结/卸载，按默认开关运行");
+                    }
+                } catch (Throwable t) {
+                    try {
+                        XposedBridge.log("[" + TAG + "] report 失败: " + t);
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+        }, "wclp-report").start();
+    }
+
+    private static String versionOf(Context ctx) {
+        try {
+            return ctx.getPackageManager()
+                    .getPackageInfo(ctx.getPackageName(), 0).versionName;
+        } catch (Throwable t) {
+            return "?";
+        }
     }
 }

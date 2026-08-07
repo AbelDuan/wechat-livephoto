@@ -18,6 +18,22 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      # 模块 App 自己的进程里没有 XposedBridge。UI 侧任何一个类只要
+      # 直接/间接引用到 de.robv.android.xposed.* 或 MainHook，
+      # 类校验就会 NoClassDefFoundError → 「打开模块就闪退」（v3 的原因）。
+      - name: Guard - UI classes must not touch Xposed
+        run: |
+          BAD=0
+          for f in MainActivity StatusProvider LogStore Const; do
+            P="app/src/main/java/com/abel/wechatlive/$f.java"
+            if grep -nE 'de\.robv\.android\.xposed|XposedBridge|XposedHelpers|MainHook' "$P"; then
+              echo "::error::$f.java 引用了 Xposed/MainHook，会导致模块 App 闪退"
+              BAD=1
+            fi
+          done
+          [ "$BAD" = "0" ] && echo "OK: UI 层与 Xposed 完全隔离"
+          exit $BAD
+
       - name: Build debug APK (auto-signed with debug key)
         uses: gradle/gradle-build-action@v3
         with:
@@ -42,6 +58,8 @@ jobs:
             exit 1
           fi
           echo "OK: 单 dex，且 MainHook 在主 dex 中"
+          echo "--- 签名指纹（应每次构建都一致，保证可覆盖安装）---"
+          unzip -p "$APK" META-INF/*.RSA 2>/dev/null | keytool -printcert 2>/dev/null | grep -E 'SHA1|SHA256' || true
 
       - name: Upload APK
         uses: actions/upload-artifact@v4

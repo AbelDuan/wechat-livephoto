@@ -1,14 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- 模块首页需要读取落盘的调试日志 -->
-    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
-    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+    <!--
+      v4 起不再需要任何存储权限：
+      微信侧的日志通过 ContentProvider 走 Binder 送进模块 App 的私有目录。
+    -->
 
     <application
         android:allowBackup="true"
         android:label="WechatLive"
-        android:requestLegacyExternalStorage="true"
         android:supportsRtl="true">
 
         <activity
@@ -21,6 +21,16 @@
             </intent-filter>
         </activity>
 
+        <!--
+          状态通道：微信进程内的 Hook 通过它回报心跳/日志，并取回用户设置的开关。
+          必须 exported，因为调用方（微信）是另一个 App。
+        -->
+        <provider
+            android:name=".StatusProvider"
+            android:authorities="com.abel.wechatlive.status"
+            android:enabled="true"
+            android:exported="true" />
+
         <!-- ===== LSPosed / Xposed 模块声明 ===== -->
         <meta-data
             android:name="xposedmodule"
@@ -30,8 +40,8 @@
             android:value="93" />
         <meta-data
             android:name="xposeddescription"
-            android:value="微信发图默认实况(LivePhoto)+原图" />
-        <!-- 静态作用域：微信 + 自身（自身用于首页激活自检） -->
+            android:value="微信发图自动实况(LivePhoto)+原图，可在应用内开关" />
+        <!-- 静态作用域：只声明微信。LSPosed 的作用域列表会过滤模块自身，勾不上是正常的 -->
         <meta-data
             android:name="xposedscope"
             android:resource="@array/xposed_scope" />
