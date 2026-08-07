@@ -11,7 +11,7 @@ import java.lang.reflect.Field;
 import java.util.HashSet;
 import java.util.Set;
 
-import de.robv.android.xposed.IXposedMod;
+import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
@@ -36,7 +36,7 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  * CLICK_FALLBACK：保留旧的点按兜底（vid=uzc / 文字"实况"），默认关闭。
  * 仅在你想要「界面上也点一下勾上」时设为 true。
  */
-public class MainHook implements IXposedMod {
+public class MainHook implements IXposedHookLoadPackage {
 
     // ===== 开关 =====
     private static final boolean PROBE = true;            // 探测模式：打印字段
