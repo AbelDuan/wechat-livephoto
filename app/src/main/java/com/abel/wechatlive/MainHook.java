@@ -22,6 +22,7 @@ import java.io.RandomAccessFile;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -105,6 +106,16 @@ public class MainHook implements IXposedHookLoadPackage {
     private static volatile int sDecodeBlocked = 0;    // BitmapFactory 解码降采样拦截次数
     private static volatile boolean sLibsDumped = false;
 
+    // ── v8.0 原图直塞状态 ──
+    // 会话内抓到的「用户相册真实照片」候选（FileInputStream 探针过滤后写入）
+    private static final List<String> sPhotoCandidates = new ArrayList<String>();
+    // 原图宽高缓存，避免每次 compress 都重新解码 bounds
+    private static final Map<String, int[]> sBoundsCache = new HashMap<String, int[]>();
+    // 直塞/探测自身产生的 IO 标记，防止递归触发各类探针
+    private static volatile boolean sInjecting = false;
+    private static volatile int sRawInjected = 0;      // 原图字节直塞成功次数
+    private static volatile int sQualityBoost = 0;     // quality 拉满次数
+
     private static String sProc = "?";
     private static long sLastReport = 0L;
     private static int sForceCount = 0;
@@ -141,7 +152,7 @@ public class MainHook implements IXposedHookLoadPackage {
         sProc = lp.processName;
 
         log("========================================");
-        log("WechatLive v7.9 注入成功  proc=" + sProc);
+        log("WechatLive v8.0 注入成功  proc=" + sProc);
 
         // 相册只在主进程，重量级 hook 只装主进程，避免 :push/:appbrand 等无谓开销
         boolean main = Const.WECHAT_PKG.equals(sProc);
@@ -351,11 +362,62 @@ public class MainHook implements IXposedHookLoadPackage {
                     java.io.OutputStream.class,
                     new XC_MethodHook() {
                         private int logged = 0;
+
+                        /** v8.0：在编码前介入——首选原图字节直塞，兜底把 quality 拉满 */
                         @Override
-                        protected void afterHookedMethod(MethodHookParam p) {
-                            if (!cMomentsRaw || logged >= 12) return;
+                        protected void beforeHookedMethod(MethodHookParam p) {
+                            if (!cMomentsRaw || sInjecting) return;
+                            if (!nearSns()) return;              // 廉价前置，非朋友圈场景零开销
                             try {
                                 android.graphics.Bitmap bmp = (android.graphics.Bitmap) p.thisObject;
+                                if (bmp == null || bmp.isRecycled()) return;
+                                int w = bmp.getWidth(), h = bmp.getHeight();
+                                // 只处理「上传级主图」：>200 万像素。缩略图一律不动。
+                                if ((long) w * h < 2000000L) return;
+                                if (!inSnsStack()) return;
+
+                                boolean jpeg = String.valueOf(p.args[0]).toUpperCase(Locale.US).contains("JPEG");
+
+                                // ① 首选：把原始 JPEG 文件字节直接写进输出流。
+                                //    这样微信拿到的就是磁盘上那份原图本身——画质 100% 无损，
+                                //    且 EXIF（APP1 段在文件头部）原样保留。
+                                if (jpeg && sRawInjected < 8) {
+                                    String src = pickOriginalFor(w, h);
+                                    if (src != null) {
+                                        long n = pumpOriginalInto(src, (java.io.OutputStream) p.args[2]);
+                                        if (n > 0) {
+                                            sRawInjected++;
+                                            p.setResult(Boolean.TRUE);   // 短路：微信不再自己编码
+                                            log("★ [原图直塞] " + w + "x" + h + " 已写入原始 JPEG "
+                                                    + n + " 字节（EXIF 保留）第 " + sRawInjected + " 次"
+                                                    + "\n    src=" + src);
+                                            return;
+                                        }
+                                    }
+                                }
+
+                                // ② 兜底：找不到可用原图时，至少把编码质量拉满（实测微信写死 70）
+                                Object q0 = p.args[1];
+                                int q = (q0 instanceof Integer) ? (Integer) q0 : 100;
+                                if (q < 100) {
+                                    p.args[1] = 100;
+                                    if (sQualityBoost < 12) {
+                                        sQualityBoost++;
+                                        log("★ [质量提升] " + w + "x" + h
+                                                + " compress quality " + q + " → 100（未匹配到原图，走无损重编码）");
+                                    }
+                                }
+                            } catch (Throwable t) {
+                                log("compress 干预异常: " + t);
+                            }
+                        }
+
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam p) {
+                            if (!cMomentsRaw || !cVerbose || logged >= 8) return;
+                            try {
+                                android.graphics.Bitmap bmp = (android.graphics.Bitmap) p.thisObject;
+                                if (bmp == null || bmp.isRecycled()) return;
                                 int area = bmp.getWidth() * bmp.getHeight();
                                 if (area < 100000) return; // 只关心上传级大图压缩，忽略缩略图
                                 StackTraceElement[] st = new Throwable().getStackTrace();
@@ -380,10 +442,149 @@ public class MainHook implements IXposedHookLoadPackage {
                             }
                         }
                     });
-            log("已挂载 Bitmap.compress 朋友圈压缩探测（开启「朋友圈上传原图」后，发朋友圈可抓压缩栈）");
+            log("已挂载 Bitmap.compress 原图直塞 / 质量拉满（v8.0）");
         } catch (Throwable t) {
-            log("挂载 Bitmap.compress 探测失败: " + t);
+            log("挂载 Bitmap.compress 干预失败: " + t);
         }
+    }
+
+    // ══════════════════ v8.0 原图直塞：候选管理 + JPEG 字节泵 ══════════════════
+
+    /** 判断是否用户相册里的真实照片（排除微信内置 emoji / 模板 png / 缓存） */
+    private static boolean isUserPhoto(String path) {
+        if (path == null) return false;
+        String low = path.toLowerCase(Locale.US);
+        if (low.contains("/data/data/") || low.contains("/micromsg/")) return false;
+        if (!(low.startsWith("/storage/") || low.startsWith("/sdcard/"))) return false;
+        if (low.contains("/cache/") || low.contains("thumb")) return false;
+        return low.endsWith(".jpg") || low.endsWith(".jpeg");
+    }
+
+    /** 记录一个候选原图（去重，最多 16 条） */
+    private static void addPhotoCandidate(String path) {
+        synchronized (sPhotoCandidates) {
+            sPhotoCandidates.remove(path);          // 移到队尾（最近使用优先）
+            sPhotoCandidates.add(path);
+            while (sPhotoCandidates.size() > 16) sPhotoCandidates.remove(0);
+        }
+    }
+
+    /**
+     * 找出「像素尺寸与当前待编码 Bitmap 完全一致」的原图文件。
+     * 只接受精确相等：若宽高互换（EXIF 旋转 90°），说明微信已把图转正，
+     * 此时直塞原图会导致方向错误，宁可退回质量拉满。
+     */
+    private static String pickOriginalFor(int w, int h) {
+        List<String> snapshot;
+        synchronized (sPhotoCandidates) {
+            snapshot = new ArrayList<String>(sPhotoCandidates);
+        }
+        // 最近读取的优先
+        for (int i = snapshot.size() - 1; i >= 0; i--) {
+            String path = snapshot.get(i);
+            try {
+                File f = new File(path);
+                if (!f.isFile()) continue;
+                long len = f.length();
+                if (len < 300 * 1024L || len > 40 * 1024 * 1024L) continue;  // 太小不是原图，太大不敢塞
+                int[] wh = boundsOf(path);
+                if (wh == null) continue;
+                if (wh[0] == w && wh[1] == h) return path;
+            } catch (Throwable ignored) {
+            }
+        }
+        return null;
+    }
+
+    /** 解码图片宽高（带缓存，避免重复 IO） */
+    private static int[] boundsOf(String path) {
+        int[] c = sBoundsCache.get(path);
+        if (c != null) return c;
+        boolean prev = sInjecting;
+        sInjecting = true;                 // 避免自身的解码/读文件再次触发各类探针
+        try {
+            android.graphics.BitmapFactory.Options o = new android.graphics.BitmapFactory.Options();
+            o.inJustDecodeBounds = true;
+            android.graphics.BitmapFactory.decodeFile(path, o);
+            if (o.outWidth <= 0 || o.outHeight <= 0) return null;
+            int[] wh = new int[]{o.outWidth, o.outHeight};
+            sBoundsCache.put(path, wh);
+            return wh;
+        } catch (Throwable t) {
+            return null;
+        } finally {
+            sInjecting = prev;
+        }
+    }
+
+    /**
+     * 把原始 JPEG 字节写进输出流，返回写入字节数（失败返回 0）。
+     * 会截断到 JPEG 的 EOI 标记：Motion Photo(MVIMG) 在 JPEG 尾部附了一段 MP4 视频，
+     * 直接整份塞进去会让上传体积翻倍且可能被服务端拒绝。
+     */
+    private static long pumpOriginalInto(String path, java.io.OutputStream os) {
+        if (os == null) return 0;
+        boolean prev = sInjecting;
+        sInjecting = true;
+        try {
+            File f = new File(path);
+            long len = f.length();
+            if (len <= 0 || len > 40 * 1024 * 1024L) return 0;
+            byte[] data = new byte[(int) len];
+            FileInputStream in = new FileInputStream(f);
+            try {
+                int off = 0, r;
+                while (off < data.length && (r = in.read(data, off, data.length - off)) > 0) off += r;
+                if (off < data.length) return 0;
+            } finally {
+                try { in.close(); } catch (Throwable ignored) { }
+            }
+            if (data.length < 4 || (data[0] & 0xFF) != 0xFF || (data[1] & 0xFF) != 0xD8) return 0; // 不是 JPEG
+            int end = jpegEndOffset(data);
+            if (end <= 0 || end > data.length) end = data.length;
+            os.write(data, 0, end);
+            os.flush();
+            return end;
+        } catch (Throwable t) {
+            log("原图直塞失败: " + t);
+            return 0;
+        } finally {
+            sInjecting = prev;
+        }
+    }
+
+    /** 扫描 JPEG 段结构，返回 EOI(FFD9) 之后的偏移；解析不出来返回全长 */
+    private static int jpegEndOffset(byte[] d) {
+        try {
+            int i = 2;                       // 跳过 SOI(FFD8)
+            int n = d.length;
+            while (i < n - 1) {
+                if ((d[i] & 0xFF) != 0xFF) { i++; continue; }
+                int m = d[i + 1] & 0xFF;
+                if (m == 0xFF) { i++; continue; }                       // 填充字节
+                if (m == 0xD8 || m == 0x01 || (m >= 0xD0 && m <= 0xD7)) { i += 2; continue; }
+                if (m == 0xD9) return i + 2;                            // EOI
+                if (i + 3 >= n) break;
+                int segLen = ((d[i + 2] & 0xFF) << 8) | (d[i + 3] & 0xFF);
+                if (segLen < 2) break;
+                if (m == 0xDA) {                                        // SOS：后面是熵编码数据
+                    int j = i + 2 + segLen;
+                    while (j < n - 1) {
+                        if ((d[j] & 0xFF) != 0xFF) { j++; continue; }
+                        int m2 = d[j + 1] & 0xFF;
+                        if (m2 == 0x00 || m2 == 0xFF || (m2 >= 0xD0 && m2 <= 0xD7)) { j += 2; continue; }
+                        if (m2 == 0xD9) return j + 2;                   // 找到 EOI
+                        break;                                          // 其它 marker（progressive 的下一段）
+                    }
+                    if (j >= n - 1) break;
+                    i = j;
+                    continue;
+                }
+                i += 2 + segLen;
+            }
+        } catch (Throwable ignored) {
+        }
+        return d.length;
     }
 
     /**
@@ -517,17 +718,15 @@ public class MainHook implements IXposedHookLoadPackage {
         XC_MethodHook srcHook = new XC_MethodHook() {
             @Override
             protected void afterHookedMethod(MethodHookParam p) {
-                if (sCopying || !cMomentsRaw) return;
+                if (sCopying || sInjecting || !cMomentsRaw) return;
                 try {
                     Object a0 = p.args[0];
                     String path = a0 instanceof File ? ((File) a0).getAbsolutePath()
                             : (a0 instanceof String ? (String) a0 : null);
                     if (path == null) return;
-                    String low = path.toLowerCase(Locale.US);
-                    // 原图在 DCIM/Pictures 等外部目录，不在 MicroMsg 草稿里；且是图片
-                    if (path.contains("/MicroMsg/")) return;
-                    if (!(low.endsWith(".jpg") || low.endsWith(".jpeg") || low.endsWith(".png")
-                            || low.endsWith(".webp"))) return;
+                    // v8.0：只认用户相册里的真实照片（/storage 下的 jpg）。
+                    // 旧版本把微信内置 emoji / wxa 模板 png 也当原图记下来，日志噪音极大且会污染匹配。
+                    if (!isUserPhoto(path)) return;
                     // 调用栈必须来自朋友圈压缩链，避免误抓其它读图
                     StackTraceElement[] st = new Throwable().getStackTrace();
                     boolean sns = false;
@@ -541,8 +740,13 @@ public class MainHook implements IXposedHookLoadPackage {
                         }
                     }
                     if (!sns) return;
+                    boolean isNew;
+                    synchronized (sPhotoCandidates) {
+                        isNew = !sPhotoCandidates.contains(path);
+                    }
                     sLastOriginalPath = path;
-                    log("★ [朋友圈原图读取] path=" + path);
+                    addPhotoCandidate(path);            // v8.0：纳入原图直塞候选池
+                    if (isNew) log("★ [朋友圈原图读取] path=" + path);
                 } catch (Throwable ignored) {
                 }
             }
@@ -608,8 +812,11 @@ public class MainHook implements IXposedHookLoadPackage {
                                 + "  sns=" + sns + "  " + p.method.getName()
                                 + "\n    栈: " + stackBrief());
                     }
-                    // 仅拦截 sns 上下文下的「上传级大图」降采样：长边 > 2560 说明这是原图在被压
-                    if (sns && Math.max(sw, sh) > 2560 && sBlocked < 24) {
+                    // 仅拦截 sns 上下文下的「上传级大图」降采样：源长边 > 2560 说明这是原图在被压。
+                    // ⚠ 必须同时要求「目标也是大图」(长边 >= 1000)：
+                    //   实测预览阶段会有 4096x3072 -> 267x200 这类缩略图缩放，若也拦截，
+                    //   相当于拿 48MB 的全尺寸 Bitmap 去当 267x200 的缩略图用，十几次就 OOM/卡死。
+                    if (sns && Math.max(sw, sh) > 2560 && Math.max(dw, dh) >= 1000 && sBlocked < 24) {
                         sBlocked++;
                         p.setResult(src);   // 直接返回原图，取消这次降采样
                         log("★ [朋友圈拦截] 已阻止降采样 " + sw + "x" + sh + " -> " + dw + "x" + dh
@@ -695,6 +902,10 @@ public class MainHook implements IXposedHookLoadPackage {
                     boolean densityScale = o.inScaled && o.inDensity > 0 && o.inTargetDensity > 0
                             && o.inDensity != o.inTargetDensity;
                     if (o.inSampleSize <= 1 && !densityScale) return;
+                    // ⚠ inSampleSize 很大（>4）说明微信要的是缩略图/预览图（实测预览阶段用 15，
+                    //   即 1/15 尺寸）。强行解成全尺寸会把 48MB 的 Bitmap 当缩略图用，直接 OOM。
+                    //   上传主图的降采样倍率很小，卡在 4 以内足够覆盖。
+                    if (o.inSampleSize > 4) return;
                     if (!nearSns() || !inSnsStack()) return;
                     if (sDecodeBlocked >= 16) return;
                     sDecodeBlocked++;
@@ -811,20 +1022,26 @@ public class MainHook implements IXposedHookLoadPackage {
         });
     }
 
-    /** 是否「图片类临时文件」：pre_temp_sns_live_photo* 中、排除纯视频 remux（无 _thumb 后缀） */
+    /**
+     * 是否「可覆盖的图片类临时文件」。
+     * v8.0 收紧：只认 base（pre_temp_sns_live_photo<32hex>）和 _parse_ 解析图。
+     * 实测 v7.9 会把 8.5MB 原图写进 _remux_thumb_（缩略图），导致缩略图异常膨胀——必须排除。
+     */
     private static boolean isImageTemp(String path) {
         if (path == null) return false;
         String name = new File(path).getName();
         if (!name.startsWith("pre_temp_sns_live_photo")) return false;
-        // 纯视频 remux（pre_temp_sns_live_photo_remux_<32hex>，无 _thumb）= 实况的视频流，
-        // 不能用原图覆盖；其余（base / _parse_<hash> / _remux_thumb_<hash>）都是图片，可覆盖。
-        return !name.matches("pre_temp_sns_live_photo_remux_[0-9a-fA-F]{32}");
+        if (name.contains("_thumb")) return false;                  // 缩略图，绝不塞原图
+        if (name.matches("pre_temp_sns_live_photo_remux_[0-9a-fA-F]{32}")) return false;  // 实况视频流
+        return true;
     }
 
-    /** 是否纯视频 remux（实况视频流），复制法必须跳过，否则会把视频写成图片字节 */
+    /** 是否纯视频 remux（实况视频流）或缩略图，复制法必须跳过 */
     private static boolean isVideoRemux(String path) {
         if (path == null) return false;
-        return new File(path).getName().matches("pre_temp_sns_live_photo_remux_[0-9a-fA-F]{32}");
+        String name = new File(path).getName();
+        return name.contains("_thumb")
+                || name.matches("pre_temp_sns_live_photo_remux_[0-9a-fA-F]{32}");
     }
 
     /** 把原图覆盖进朋友圈上传临时文件（复制法核心动作）。一次成功即停，避免反复写。 */
