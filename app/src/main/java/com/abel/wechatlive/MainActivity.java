@@ -13,6 +13,7 @@ import android.graphics.Typeface;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.text.method.ScrollingMovementMethod;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
@@ -101,11 +102,18 @@ public class MainActivity extends Activity {
     // ────────────────────────────── UI ──────────────────────────────
 
     private void buildUi() {
+        // 最外层可滚动容器：所有内容（状态/开关/按钮/日志）都能滚动查看，
+        // 不再因屏幕矮而被挤掉。日志区给固定高度 + 内部滚动，永不被压成一行。
+        ScrollView outer = new ScrollView(this);
+        outer.setBackgroundColor(Color.parseColor("#F5F6F8"));
+        outer.setFillViewport(true);
+
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setBackgroundColor(Color.parseColor("#F5F6F8"));
         int p = dp(16);
-        root.setPadding(p, p, p, dp(10));
+        root.setPadding(p, dp(12), p, dp(10));
+        outer.addView(root, new ScrollView.LayoutParams(
+                ScrollView.LayoutParams.MATCH_PARENT, ScrollView.LayoutParams.WRAP_CONTENT));
 
         // ── 状态横幅 ──
         statusView = new TextView(this);
@@ -221,20 +229,22 @@ public class MainActivity extends Activity {
 
         root.addView(iconBox, mw());
 
-        // ── 日志区 ──
+        // ── 日志区（固定高度 + 内部滚动，永不被上方选项挤成一行）──
         logView = new TextView(this);
-        logView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 9);
+        logView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
         logView.setTextColor(Color.parseColor("#2E2E2E"));
         logView.setTypeface(Typeface.MONOSPACE);
-        logView.setTextIsSelectable(true);
-        ScrollView sv = new ScrollView(this);
-        sv.setBackgroundColor(Color.WHITE);
-        sv.setPadding(dp(8), dp(8), dp(8), dp(8));
-        sv.addView(logView);
-        root.addView(sv, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+        logView.setBackgroundColor(Color.WHITE);
+        logView.setPadding(dp(8), dp(8), dp(8), dp(8));
+        // 内部纵向滚动，让它在本固定高度盒子里显示全部日志（不依赖外层滚动，也不被裁剪）
+        logView.setMovementMethod(new ScrollingMovementMethod());
+        logView.setVerticalScrollBarEnabled(true);
+        LinearLayout.LayoutParams logLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(340));
+        logLp.setMargins(0, dp(10), 0, 0);
+        root.addView(logView, logLp);
 
-        setContentView(root);
+        setContentView(outer);
     }
 
     private CheckBox addCheck(LinearLayout parent, final String key,

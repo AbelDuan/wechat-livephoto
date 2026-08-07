@@ -115,7 +115,7 @@ public class MainHook implements IXposedHookLoadPackage {
         sProc = lp.processName;
 
         log("========================================");
-        log("WechatLive v5 注入成功  proc=" + sProc);
+        log("WechatLive v7.3 注入成功  proc=" + sProc);
 
         // 相册只在主进程，重量级 hook 只装主进程，避免 :push/:appbrand 等无谓开销
         boolean main = Const.WECHAT_PKG.equals(sProc);
@@ -296,6 +296,7 @@ public class MainHook implements IXposedHookLoadPackage {
 
         if (!cEnabled) return;
         boolean gallery = looksLikeGallery(cls);
+        boolean moments = isMomentsPublisher(cls);
         // 更极致：非相册界面不心跳；仅首次 onResume 上报一次以证明注入成功
         if (!gallery && sReportedOnce) return;
         // 心跳 + 拉取开关（后台线程，不阻塞微信主线程）
@@ -305,15 +306,25 @@ public class MainHook implements IXposedHookLoadPackage {
         if (!gallery) return;     // 非相册界面：仅心跳，不做 extras 验证
 
         // 相册 / 朋友圈发布界面：把实际生效的 extras 打出来
-        dumpIntentExtras(act);
+        dumpIntentExtras(act, moments);
 
-        if (isMomentsPublisher(cls)) {
-            log("进入朋友圈发布界面；如需定位图片压缩类，请开启「详细日志」并发一条朋友圈");
+        if (moments) {
+            log("★ 朋友圈发布界面：已抓取该界面全部 Intent extras（见上方）。");
+            log("  诊断已落盘——请在本界面停留约 1 秒，再回 App「导出日志」即可拿到完整抓取。");
+            log("  如需 View 树，请开启「详细日志」后重新进入本界面。");
         }
 
-        if (!cVerbose) return;
+        if (!cVerbose) {
+            // 即使不抓 View 树，也确保上面的 extras 诊断已被写入 App 文件
+            // （否则单次进入朋友圈后导出，会因 report 限流而漏掉这次诊断）。
+            flushLog(act.getApplicationContext());
+            return;
+        }
         Handler h = ui();
-        if (h == null) return;
+        if (h == null) {
+            flushLog(act.getApplicationContext());
+            return;
+        }
         h.postDelayed(new Runnable() {
             @Override
             public void run() {
@@ -325,29 +336,81 @@ public class MainHook implements IXposedHookLoadPackage {
                 } catch (Throwable t) {
                     log("dumpView error: " + t);
                 }
+                flushLog(act.getApplicationContext());
             }
         }, 800);
     }
 
-    /** 打印相册 Activity 实际收到的 extras —— 强制成功与否，一眼可见 */
-    private static void dumpIntentExtras(Activity act) {
+    /**
+     * 打印相册/朋友圈 Activity 实际收到的 extras —— 强制成功与否，一眼可见。
+     * 朋友圈走 moments 分支：枚举全部 extras 键，找出原图/画质相关键，
+     * 为后续「转换法/复制法」定位微信压缩入口提供线索。
+     */
+    private static void dumpIntentExtras(Activity act, boolean moments) {
         try {
             Intent it = act.getIntent();
-            if (it == null) return;
+            if (it == null) { log("Intent extras: null"); return; }
             Bundle b = it.getExtras();
-            if (b == null) return;
-            StringBuilder sb = new StringBuilder("Intent extras 关键项: ");
-            String[] keys = {K_LIVE_AUTO, K_LIVE_QUERY, K_SEND_RAW, K_SHOW_RAW_BTN};
-            for (String k : keys) {
-                if (b.containsKey(k)) {
-                    sb.append(k).append('=').append(b.getBoolean(k)).append("  ");
+            if (b == null) { log("Intent extras: null"); return; }
+            if (moments) {
+                StringBuilder sb = new StringBuilder(
+                        "Intent extras(全部, 朋友圈) [count=" + b.size() + "]: ");
+                boolean first = true;
+                for (String k : b.keySet()) {
+                    if (!first) sb.append("  ");
+                    first = false;
+                    sb.append(k).append('=').append(truncate(b.get(k)));
                 }
+                log(sb.toString());
+            } else {
+                StringBuilder sb = new StringBuilder("Intent extras 关键项: ");
+                String[] keys = {K_LIVE_AUTO, K_LIVE_QUERY, K_SEND_RAW, K_SHOW_RAW_BTN};
+                boolean any = false;
+                for (String k : keys) {
+                    if (b.containsKey(k)) {
+                        sb.append(k).append('=').append(b.getBoolean(k)).append("  ");
+                        any = true;
+                    }
+                }
+                if (!any) sb.append("(无已知键)");
+                log(sb.toString());
             }
-            log(sb.toString());
             log("累计强制改写次数 = " + sForceCount);
         } catch (Throwable t) {
             log("dumpIntentExtras error: " + t);
         }
+    }
+
+    /** 值可能很大（Parcelable / 数组），截短以免刷屏 */
+    private static String truncate(Object v) {
+        if (v == null) return "null";
+        String s = v.toString();
+        if (s.length() > 90) s = s.substring(0, 90) + "...(len=" + s.length() + ")";
+        return s;
+    }
+
+    /** 立即把当前 PENDING 日志刷到 App 文件（绕过心跳限流），诊断抓取后确保数据落盘 */
+    private static void flushLog(final Context ctx) {
+        if (ctx == null) return;
+        final String payload = drainPending();
+        if (payload.length() == 0) return;
+        final String ver = wxVersion(ctx);
+        EXEC.execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    ContentResolver cr = ctx.getContentResolver();
+                    Bundle in = new Bundle();
+                    in.putString(Const.K_LAST_ACT, sCurrentActivity);
+                    in.putString(Const.K_WX_VER, ver);
+                    in.putString("proc", sProc);
+                    in.putInt("forced", sForceCount);
+                    in.putString(Const.KEY_LOG, payload);
+                    cr.call(Uri.parse(Const.URI), Const.METHOD_REPORT, null, in);
+                } catch (Throwable ignored) {
+                }
+            }
+        });
     }
 
     private static boolean looksLikeGallery(String cls) {
