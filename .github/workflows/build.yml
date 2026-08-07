@@ -1,4 +1,4 @@
-name: Build WeChat LivePhoto LSPosed Module
+name: Build WechatLive LSPosed Module
 
 on:
   push:
@@ -28,5 +28,5 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: wechat-livephoto-apk
+          name: WechatLive-apk
           path: app/build/outputs/apk/debug/*.apk

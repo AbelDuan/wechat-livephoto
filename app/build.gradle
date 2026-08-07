@@ -3,18 +3,18 @@ apply plugin: 'com.android.application'
 android {
     compileSdkVersion 33
     defaultConfig {
-        applicationId "com.example.wechatlivephoto"
+        applicationId "com.abel.wechatlive"
         minSdkVersion 24
         targetSdkVersion 33
-        versionCode 1
-        versionName "1.0"
+        versionCode 2
+        versionName "2.0"
     }
     buildTypes {
         release {
             minifyEnabled false
         }
     }
-    namespace 'com.example.wechatlivephoto'
+    namespace 'com.abel.wechatlive'
 }
 
 dependencies {

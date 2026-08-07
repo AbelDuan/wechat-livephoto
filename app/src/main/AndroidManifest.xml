@@ -1,8 +1,22 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.example.wechatlivephoto">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <application>
+    <application
+        android:allowBackup="true"
+        android:label="WechatLive"
+        android:supportsRtl="true">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="WechatLive">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- ===== LSPosed / Xposed 模块声明 ===== -->
         <meta-data
             android:name="xposedmodule"
             android:value="true" />
@@ -11,7 +25,12 @@
             android:value="93" />
         <meta-data
             android:name="xposeddescription"
-            android:value="微信发送图片自动勾选实况(LivePhoto) - 基于 LSPosed" />
+            android:value="微信发图默认实况(LivePhoto)+原图" />
+        <!-- 静态作用域：安装后 LSPosed 会自动推荐/勾选 com.tencent.mm -->
+        <meta-data
+            android:name="xposedscope"
+            android:resource="@array/xposed_scope" />
+
     </application>
 
 </manifest>
