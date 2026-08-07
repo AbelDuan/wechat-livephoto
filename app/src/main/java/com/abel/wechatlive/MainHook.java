@@ -111,6 +111,22 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final List<String> sPhotoCandidates = new ArrayList<String>();
     // 原图宽高缓存，避免每次 compress 都重新解码 bounds
     private static final Map<String, int[]> sBoundsCache = new HashMap<String, int[]>();
+
+    // ── v8.1 日志自动落盘 ──
+    // 根因：flushLog 原本只在 onResume 诊断处调用。点「发表」后 SnsUploadUI 直接 finish，
+    // 不再有 onResume，导致发表阶段（compress / 原图直塞）的关键日志全部烂在内存里从未落盘，
+    // 用户导出时只能拿到「发表前」的快照。这里改为「有日志就自动落盘」。
+    private static volatile Context sAppCtx;              // 全局 ApplicationContext（onResume 时保存）
+    private static volatile long sLastFlushMs = 0L;       // 上次落盘时间（限流用）
+    private static volatile boolean sFlushing = false;    // 落盘进行中：防止 IPC 自身触发的日志递归
+    private static final long FLUSH_INTERVAL_MS = 1200L;  // 普通日志的落盘节流间隔
+    // 已 dump 过 View 树的 Activity，避免同一界面反复 dump（一次 600+ 行，会把关键日志淹没）
+    private static final Set<String> sDumpedActs = new HashSet<String>();
+    // v8.1 目录兜底扫描：候选池匹配不上时，从 DCIM/Pictures 按尺寸找原图
+    private static volatile boolean sDirScanned = false;
+    private static final List<String> sDirPhotos = new ArrayList<String>();
+    // v8.1 直塞决策日志次数（未命中时说明原因，限次避免刷屏）
+    private static volatile int sDecisionLogged = 0;
     // 直塞/探测自身产生的 IO 标记，防止递归触发各类探针
     private static volatile boolean sInjecting = false;
     private static volatile int sRawInjected = 0;      // 原图字节直塞成功次数
@@ -152,7 +168,7 @@ public class MainHook implements IXposedHookLoadPackage {
         sProc = lp.processName;
 
         log("========================================");
-        log("WechatLive v8.0 注入成功  proc=" + sProc);
+        log("WechatLive v8.1 注入成功  proc=" + sProc);
 
         // 相册只在主进程，重量级 hook 只装主进程，避免 :push/:appbrand 等无谓开销
         boolean main = Const.WECHAT_PKG.equals(sProc);
@@ -306,6 +322,10 @@ public class MainHook implements IXposedHookLoadPackage {
                         protected void beforeHookedMethod(MethodHookParam param) {
                             try {
                                 sCurrentActivity = param.thisObject.getClass().getName();
+                                // v8.1：尽早拿到 ApplicationContext，让自动落盘从第一个 Activity 就能工作
+                                if (sAppCtx == null) {
+                                    sAppCtx = ((Activity) param.thisObject).getApplicationContext();
+                                }
                                 // v7.8：朋友圈发布界面直接把原图键注入 Intent，保证键真实存在。
                                 // 读取侧覆盖值(旧方案)在 SnsUploadUI 的 Intent 不含该键时无效
                                 // （微信可能靠 containsKey 判断），这里在 WeChat 读取前写入 Bundle。
@@ -341,6 +361,24 @@ public class MainHook implements IXposedHookLoadPackage {
             log("已挂载 Activity#onResume");
         } catch (Throwable t) {
             log("挂载 Activity#onResume 失败: " + t);
+        }
+        // v8.1：onPause 兜底落盘。点「发表」后 SnsUploadUI 会 finish，
+        // onPause 是它生命周期里最后一个可靠回调，此时把日志刷出去。
+        try {
+            XposedHelpers.findAndHookMethod(Activity.class, "onPause", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    try {
+                        Context c = ((Activity) param.thisObject).getApplicationContext();
+                        if (sAppCtx == null) sAppCtx = c;
+                        flushLog(c);
+                    } catch (Throwable ignored) {
+                    }
+                }
+            });
+            log("已挂载 Activity#onPause（日志兜底落盘）");
+        } catch (Throwable t) {
+            log("挂载 Activity#onPause 失败: " + t);
         }
     }
 
@@ -393,7 +431,17 @@ public class MainHook implements IXposedHookLoadPackage {
                                                     + "\n    src=" + src);
                                             return;
                                         }
+                                        log("★ [直塞决策] 匹配到 " + shortPath(src) + " 但写入失败，退兜底");
+                                    } else if (sDecisionLogged < 6) {
+                                        // v8.1：没命中一定要说清为什么，否则下一版只能靠猜。
+                                        sDecisionLogged++;
+                                        log("★ [直塞决策] 未匹配 目标=" + w + "x" + h
+                                                + " " + candidateSummary());
                                     }
+                                } else if (!jpeg && sDecisionLogged < 6) {
+                                    sDecisionLogged++;
+                                    log("★ [直塞决策] 跳过：非 JPEG 编码 format=" + p.args[0]
+                                            + " 尺寸=" + w + "x" + h);
                                 }
 
                                 // ② 兜底：找不到可用原图时，至少把编码质量拉满（实测微信写死 70）
@@ -460,6 +508,24 @@ public class MainHook implements IXposedHookLoadPackage {
         return low.endsWith(".jpg") || low.endsWith(".jpeg");
     }
 
+    /** v8.1：把候选池里每个文件的尺寸列出来，直塞未命中时一眼看出差在哪 */
+    private static String candidateSummary() {
+        List<String> snapshot;
+        synchronized (sPhotoCandidates) {
+            snapshot = new ArrayList<String>(sPhotoCandidates);
+        }
+        StringBuilder sb = new StringBuilder("候选池=").append(snapshot.size());
+        int n = 0;
+        for (int i = snapshot.size() - 1; i >= 0 && n < 6; i--, n++) {
+            String path = snapshot.get(i);
+            int[] wh = boundsOf(path);
+            sb.append("\n    ").append(wh == null ? "?x?" : (wh[0] + "x" + wh[1]))
+                    .append("  ").append(shortPath(path));
+        }
+        if (sDirScanned) sb.append("\n    (目录扫描池=").append(sDirPhotos.size()).append(")");
+        return sb.toString();
+    }
+
     /** 记录一个候选原图（去重，最多 16 条） */
     private static void addPhotoCandidate(String path) {
         synchronized (sPhotoCandidates) {
@@ -479,9 +545,31 @@ public class MainHook implements IXposedHookLoadPackage {
         synchronized (sPhotoCandidates) {
             snapshot = new ArrayList<String>(sPhotoCandidates);
         }
-        // 最近读取的优先
-        for (int i = snapshot.size() - 1; i >= 0; i--) {
-            String path = snapshot.get(i);
+        String hit = matchIn(snapshot, w, h);
+        if (hit != null) return hit;
+
+        // v8.1 兜底：候选池没命中就直接扫相册目录。
+        // 实测探针只抓到 2 张图里的 1 张（另一张走 MediaStore Uri，不经 FileInputStream(File)），
+        // 而我们真正需要的只是「尺寸对得上的那个文件」，从磁盘找同样可靠。
+        List<String> dir = scanPhotoDirs();
+        hit = matchIn(dir, w, h);
+        if (hit != null) {
+            addPhotoCandidate(hit);     // 命中后纳入候选池，后续同尺寸图秒中
+            log("★ [直塞决策] 候选池未命中，目录扫描命中 " + shortPath(hit));
+        }
+        return hit;
+    }
+
+    /**
+     * 在给定路径列表里找尺寸匹配的原图（倒序＝最近优先）。
+     * 除精确相等外，还接受「宽高互换 + 原图 EXIF 确实标了 90/270 度旋转」的情况：
+     * 此时微信是按 EXIF 把图转正了才拿到 bitmap，而我们塞回去的原图仍带同一份 EXIF，
+     * 接收端照样会转正，最终显示方向一致——不接受这种匹配会白白漏掉一大半竖拍照片。
+     */
+    private static String matchIn(List<String> list, int w, int h) {
+        String swapped = null;
+        for (int i = list.size() - 1; i >= 0; i--) {
+            String path = list.get(i);
             try {
                 File f = new File(path);
                 if (!f.isFile()) continue;
@@ -489,11 +577,83 @@ public class MainHook implements IXposedHookLoadPackage {
                 if (len < 300 * 1024L || len > 40 * 1024 * 1024L) continue;  // 太小不是原图，太大不敢塞
                 int[] wh = boundsOf(path);
                 if (wh == null) continue;
-                if (wh[0] == w && wh[1] == h) return path;
+                if (wh[0] == w && wh[1] == h) return path;                    // 精确命中，最优
+                if (swapped == null && wh[0] == h && wh[1] == w && isRotated90(path)) {
+                    swapped = path;                                           // 暂存，继续找精确的
+                }
             } catch (Throwable ignored) {
             }
         }
-        return null;
+        if (swapped != null) {
+            log("★ [直塞决策] 按 EXIF 旋转匹配（宽高互换）命中 " + shortPath(swapped));
+        }
+        return swapped;
+    }
+
+    /** 原图 EXIF 是否标记了 90/270 度旋转（此时解码转正后宽高会互换） */
+    private static boolean isRotated90(String path) {
+        boolean prev = sInjecting;
+        sInjecting = true;
+        try {
+            int o = new android.media.ExifInterface(path)
+                    .getAttributeInt(android.media.ExifInterface.TAG_ORIENTATION, 1);
+            return o == 5 || o == 6 || o == 7 || o == 8;
+        } catch (Throwable t) {
+            return false;
+        } finally {
+            sInjecting = prev;
+        }
+    }
+
+    /**
+     * v8.1 扫描相册目录，取最近修改的 jpg（只扫一次并缓存）。
+     * 只看文件名和 mtime，不解码，开销极小；真正的尺寸比对在 matchIn 里按需做。
+     */
+    private static List<String> scanPhotoDirs() {
+        if (sDirScanned) return sDirPhotos;
+        sDirScanned = true;
+        boolean prev = sInjecting;
+        sInjecting = true;              // 屏蔽自身 IO 触发探针
+        try {
+            String[] dirs = {
+                    "/storage/emulated/0/DCIM/Camera",
+                    "/storage/emulated/0/DCIM",
+                    "/storage/emulated/0/Pictures",
+                    "/storage/emulated/0/Pictures/WeiXin",
+            };
+            List<File> all = new ArrayList<File>();
+            for (String d : dirs) {
+                File dir = new File(d);
+                if (!dir.isDirectory()) continue;
+                File[] fs = dir.listFiles();
+                if (fs == null) continue;
+                for (File f : fs) {
+                    if (!f.isFile()) continue;
+                    String low = f.getName().toLowerCase(Locale.US);
+                    if (!(low.endsWith(".jpg") || low.endsWith(".jpeg"))) continue;
+                    if (f.length() < 300 * 1024L) continue;
+                    all.add(f);
+                }
+                if (all.size() > 400) break;
+            }
+            // 按修改时间降序，只留最近 120 个——刚拍/刚选的图必在其中
+            java.util.Collections.sort(all, new java.util.Comparator<File>() {
+                @Override
+                public int compare(File a, File b) {
+                    long d = b.lastModified() - a.lastModified();
+                    return d > 0 ? 1 : (d < 0 ? -1 : 0);
+                }
+            });
+            for (int i = all.size() - 1; i >= 0 && sDirPhotos.size() < 120; i--) {
+                sDirPhotos.add(all.get(i).getAbsolutePath());   // 倒序放入，使最新的在队尾
+            }
+            log("★ [直塞决策] 相册目录扫描完成，候选 " + sDirPhotos.size() + " 个文件");
+        } catch (Throwable t) {
+            log("相册目录扫描失败: " + t);
+        } finally {
+            sInjecting = prev;
+        }
+        return sDirPhotos;
     }
 
     /** 解码图片宽高（带缓存，避免重复 IO） */
@@ -615,16 +775,12 @@ public class MainHook implements IXposedHookLoadPackage {
                     if (isImageTemp(path)) {
                         sFosTemp.put(p.thisObject, path);
                     }
+                    if (!cVerbose) return;      // v8.1：写探测纯诊断，默认不打，避免淹没关键日志
                     if (seen.contains(path)) return;
                     seen.add(path);
                     logged++;
-                    long sz = safeSize(path);
-                    StringBuilder sb = new StringBuilder();
-                    for (StackTraceElement e : new Throwable().getStackTrace()) {
-                        if (sb.length() < 3000) sb.append("\n    ").append(e.getClassName()).append('.').append(e.getMethodName());
-                        else break;
-                    }
-                    log("★ [朋友圈写探测] path=" + path + " size=" + sz + " 调用栈(top→底):" + sb);
+                    // v8.1：不再打完整调用栈（一条 30+ 行，1418 行日志里 889 行都是它）
+                    log("★ [写] " + shortPath(path) + " size=" + safeSize(path));
                 } catch (Throwable ignored) {
                 }
             }
@@ -649,15 +805,11 @@ public class MainHook implements IXposedHookLoadPackage {
                     String path = a0 instanceof File ? ((File) a0).getAbsolutePath()
                             : (a0 instanceof String ? (String) a0 : null);
                     if (path == null || !isMomentsFile(path)) return;
+                    if (!cVerbose) return;      // v8.1：RAF 探测纯诊断，默认不打
                     if (seen.contains(path)) return;
                     seen.add(path);
                     logged++;
-                    StringBuilder sb = new StringBuilder();
-                    for (StackTraceElement e : new Throwable().getStackTrace()) {
-                        if (sb.length() < 3000) sb.append("\n    ").append(e.getClassName()).append('.').append(e.getMethodName());
-                        else break;
-                    }
-                    log("★ [朋友圈RandomAccessFile探测] path=" + path + " 调用栈(top→底):" + sb);
+                    log("★ [RAF] " + shortPath(path));
                 } catch (Throwable ignored) {
                 }
             }
@@ -678,15 +830,11 @@ public class MainHook implements IXposedHookLoadPackage {
                             try {
                                 String path = (String) p.args[0];
                                 if (path == null || !isMomentsFile(path)) return;
+                                if (!cVerbose) return;      // v8.1：读探测纯诊断，默认不打
                                 if (seen.contains(path)) return;
                                 seen.add(path);
                                 logged++;
-                                StringBuilder sb = new StringBuilder();
-                                for (StackTraceElement e : new Throwable().getStackTrace()) {
-                                    if (sb.length() < 3000) sb.append("\n    ").append(e.getClassName()).append('.').append(e.getMethodName());
-                                    else break;
-                                }
-                                log("★ [朋友圈读探测] path=" + path + " 调用栈(top→底):" + sb);
+                                log("★ [读] " + shortPath(path));
                             } catch (Throwable ignored) {
                             }
                         }
@@ -727,19 +875,10 @@ public class MainHook implements IXposedHookLoadPackage {
                     // v8.0：只认用户相册里的真实照片（/storage 下的 jpg）。
                     // 旧版本把微信内置 emoji / wxa 模板 png 也当原图记下来，日志噪音极大且会污染匹配。
                     if (!isUserPhoto(path)) return;
-                    // 调用栈必须来自朋友圈压缩链，避免误抓其它读图
-                    StackTraceElement[] st = new Throwable().getStackTrace();
-                    boolean sns = false;
-                    for (StackTraceElement e : st) {
-                        String cn = e.getClassName();
-                        if (cn.contains("plugin.sns") || cn.contains("hf4") || cn.contains("lf4")
-                                || cn.contains("n1.") || cn.contains("gf4") || cn.contains("b1.")
-                                || cn.contains("l0.") || cn.contains("vfs")) {
-                            sns = true;
-                            break;
-                        }
-                    }
-                    if (!sns) return;
+                    // v8.1 放宽：只要当前处在朋友圈/相册上下文，读到的相册照片一律纳入候选。
+                    // 旧版要求调用栈含特定 sns 类名，结果两张图只抓到一张——另一张走了
+                    // 别的读取路径。候选池最终还要按尺寸精确匹配，多收几个没有副作用。
+                    if (!nearSns() && !looksLikeGallery(sCurrentActivity)) return;
                     boolean isNew;
                     synchronized (sPhotoCandidates) {
                         isNew = !sPhotoCandidates.contains(path);
@@ -1191,12 +1330,21 @@ public class MainHook implements IXposedHookLoadPackage {
             flushLog(act.getApplicationContext());
             return;
         }
+        // v8.1：同一界面只 dump 一次 View 树。一次 600+ 行，反复 dump 会把
+        // 发表阶段的关键日志彻底淹没（实测 1418 行日志里 View 树占了一多半）。
+        synchronized (sDumpedActs) {
+            if (sDumpedActs.contains(cls)) {
+                flushLog(act.getApplicationContext());
+                return;
+            }
+            sDumpedActs.add(cls);
+        }
         h.postDelayed(new Runnable() {
             @Override
             public void run() {
                 try {
                     View root = act.getWindow().getDecorView();
-                    log("---- View 树 [" + cls + "] ----");
+                    log("---- View 树 [" + cls + "]（同一界面仅首次打印）----");
                     dumpView(root, 0);
                     log("---- View 树结束 ----");
                 } catch (Throwable t) {
@@ -1258,12 +1406,17 @@ public class MainHook implements IXposedHookLoadPackage {
     /** 立即把当前 PENDING 日志刷到 App 文件（绕过心跳限流），诊断抓取后确保数据落盘 */
     private static void flushLog(final Context ctx) {
         if (ctx == null) return;
+        if (sAppCtx == null) sAppCtx = ctx;
         final String payload = drainPending();
         if (payload.length() == 0) return;
         final String ver = wxVersion(ctx);
+        sLastFlushMs = System.currentTimeMillis();
         EXEC.execute(new Runnable() {
             @Override
             public void run() {
+                // v8.1：整个 IPC 期间屏蔽自动落盘。ContentProvider.call 内部会开文件流，
+                // 会被我们自己的 FileOutputStream 探针钩到 → log() → autoFlush() → 无限递归。
+                sFlushing = true;
                 try {
                     ContentResolver cr = ctx.getContentResolver();
                     Bundle in = new Bundle();
@@ -1274,9 +1427,23 @@ public class MainHook implements IXposedHookLoadPackage {
                     in.putString(Const.KEY_LOG, payload);
                     cr.call(Uri.parse(Const.URI), Const.METHOD_REPORT, null, in);
                 } catch (Throwable ignored) {
+                } finally {
+                    sFlushing = false;
                 }
             }
         });
+    }
+
+    /**
+     * v8.1 路径缩写：微信临时文件路径长达 150+ 字符，其中 100 字符是固定前缀。
+     * 只保留「draft 目录名/文件名」，日志可读性大幅提升。
+     */
+    private static String shortPath(String path) {
+        if (path == null) return "null";
+        int i = path.indexOf("/draft/");
+        if (i >= 0) return "…/draft/" + path.substring(i + 7);
+        i = path.lastIndexOf('/');
+        return i >= 0 ? "…/" + path.substring(i + 1) : path;
     }
 
     private static boolean looksLikeGallery(String cls) {
@@ -1527,6 +1694,31 @@ public class MainHook implements IXposedHookLoadPackage {
             PENDING.add(line);
             if (PENDING.size() > 4000) PENDING.remove(0);
         }
+        // v8.1：自动落盘。关键标记（★ 且属于发表主链路）立即落盘，其余按 1.2s 节流。
+        // 不这样做的话，点「发表」后 SnsUploadUI 直接 finish、不再触发 onResume，
+        // 发表阶段的 compress / 原图直塞日志会全部留在内存里，导出时根本看不到。
+        boolean critical = msg.startsWith("★ [原图直塞]")
+                || msg.startsWith("★ [直塞决策]")
+                || msg.startsWith("★ [质量提升]")
+                || msg.startsWith("★ [朋友圈拦截]")
+                || msg.startsWith("★ [朋友圈压缩探测]");
+        autoFlush(critical);
+    }
+
+    /**
+     * v8.1 自动落盘：把内存里的日志推给 App，保证任何时刻「导出日志」都能拿到最新内容。
+     * critical=true 时绕过节流立刻落盘（发表主链路的关键日志，错过就没了）。
+     * sFlushing 守卫必不可少——落盘走 ContentProvider IPC，途中若触发探针再调 log()
+     * 会无限递归。
+     */
+    private static void autoFlush(boolean critical) {
+        if (sFlushing) return;
+        Context ctx = sAppCtx;
+        if (ctx == null) return;
+        long now = System.currentTimeMillis();
+        if (!critical && now - sLastFlushMs < FLUSH_INTERVAL_MS) return;
+        sLastFlushMs = now;
+        flushLog(ctx);
     }
 
     private static String drainPending() {
