@@ -10,6 +10,7 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.util.TypedValue;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.TextView;
@@ -92,8 +93,6 @@ public class MainHook implements IXposedHookLoadPackage {
     // ── v7.7 复制法状态 ──
     // 最近一次在朋友圈压缩链里被微信读取的原始图片路径（FileInputStream 探针抓到）
     private static volatile String sLastOriginalPath;
-    // 已关闭的「基础临时文件」计数（用于按顺序把原图映射到第 N 张图）
-    private static int sBaseTempClosed = 0;
     // 复制法覆盖进行中标记：避免覆盖动作自身打开的流再次触发探针/递归
     private static volatile boolean sCopying = false;
     // 记录微信正在写入的「基础临时文件」对应的 FileOutputStream 实例（WeakHashMap 避免泄漏）
@@ -135,7 +134,7 @@ public class MainHook implements IXposedHookLoadPackage {
         sProc = lp.processName;
 
         log("========================================");
-        log("WechatLive v7.7 注入成功  proc=" + sProc);
+        log("WechatLive v7.8 注入成功  proc=" + sProc);
 
         // 相册只在主进程，重量级 hook 只装主进程，避免 :push/:appbrand 等无谓开销
         boolean main = Const.WECHAT_PKG.equals(sProc);
@@ -150,6 +149,7 @@ public class MainHook implements IXposedHookLoadPackage {
         installMomentsProbe();
         installPathCapture();
         installMomentsCopy();   // v7.7：复制法（用原图替换朋友圈上传临时文件，绕过压缩）
+        installMomentsScaleProbe(); // v7.8：朋友圈缩放探测（定位内存降采样入口，若注入仍压缩则精准定位）
     }
 
     // ═══════════════ 核心：改写 Intent / Bundle 里的开关键 ═══════════════
@@ -172,9 +172,10 @@ public class MainHook implements IXposedHookLoadPackage {
                 if (K_SHOW_RAW_BTN.equals(key)) return Boolean.TRUE;
             }
         }
-        if (cMomentsRaw && isMomentsPublisher(sCurrentActivity)) {
-            // 朋友圈上传原图：单独开关控制，开启后在该界面强制原图键。
-            // 注意：这只能控制 Intent 层，真正绕过压缩需要后续定位图片压缩类。
+        if (cMomentsRaw && (isMomentsPublisher(sCurrentActivity) || looksLikeGallery(sCurrentActivity))) {
+            // 朋友圈上传原图：单独开关控制。开启后在「相册选择界面」(构建启动 SnsUploadUI 的
+            // Intent 时)与 SnsUploadUI 自身都强制原图键，确保键真实存在(containsKey 通过)，
+            // 而非仅在读取侧覆盖值——实测 SnsUploadUI 的 Intent 不含该键会导致强制失效。
             if (K_SEND_RAW.equals(key)) return Boolean.TRUE;
             if (K_SHOW_RAW_BTN.equals(key)) return Boolean.TRUE;
         }
@@ -287,6 +288,17 @@ public class MainHook implements IXposedHookLoadPackage {
                         protected void beforeHookedMethod(MethodHookParam param) {
                             try {
                                 sCurrentActivity = param.thisObject.getClass().getName();
+                                // v7.8：朋友圈发布界面直接把原图键注入 Intent，保证键真实存在。
+                                // 读取侧覆盖值(旧方案)在 SnsUploadUI 的 Intent 不含该键时无效
+                                // （微信可能靠 containsKey 判断），这里在 WeChat 读取前写入 Bundle。
+                                if (cMomentsRaw && isMomentsPublisher(sCurrentActivity)) {
+                                    Intent it = ((Activity) param.thisObject).getIntent();
+                                    if (it != null) {
+                                        it.putExtra(K_SEND_RAW, true);
+                                        it.putExtra(K_SHOW_RAW_BTN, true);
+                                        log("★ [朋友圈注入] SnsUploadUI Intent 已注入 send_raw_img=true");
+                                    }
+                                }
                             } catch (Throwable ignored) {
                             }
                         }
@@ -388,9 +400,9 @@ public class MainHook implements IXposedHookLoadPackage {
                     String path = a0 instanceof File ? ((File) a0).getAbsolutePath()
                             : (a0 instanceof String ? (String) a0 : null);
                     if (path == null || !isMomentsFile(path)) return;
-                    // 记录「基础临时文件」(pre_temp_sns_live_photo<hash>，无 _parse/_remux/_thumb 后缀)，
-                    // 供 v7.7 复制法在流关闭后把原图覆盖进去。
-                    if (isBaseTemp(path)) {
+                    // 记录「图片类临时文件」(base / _parse / _remux_thumb，排除纯视频 remux)，
+                    // 供复制法在流关闭后把原图覆盖进去。
+                    if (isImageTemp(path)) {
                         sFosTemp.put(p.thisObject, path);
                     }
                     if (seen.contains(path)) return;
@@ -539,19 +551,14 @@ public class MainHook implements IXposedHookLoadPackage {
                 if (sCopying || !cMomentsRaw) return;
                 try {
                     String temp = sFosTemp.remove(p.thisObject);
-                        if (temp == null) return;
-                        if (!isBaseTemp(temp)) return;
-                        int idx = sBaseTempClosed;   // 第 idx 个基础临时文件 ↔ 第 idx 张原图
-                        sBaseTempClosed++;
-                        synchronized (sSelectedPaths) {
-                            if (idx < sSelectedPaths.size()) {
-                                overwriteTempWithOriginal(temp, sSelectedPaths.get(idx));
-                            } else if (sLastOriginalPath != null) {
-                                overwriteTempWithOriginal(temp, sLastOriginalPath);
-                            }
-                        }
-                    } catch (Throwable ignored) {
+                    if (temp == null) return;
+                    if (isVideoRemux(temp)) return;   // 实况视频流，绝不覆盖
+                    // 用最近一次在朋友圈压缩链里抓到的原图覆盖（FIS 探针比 Intent 路径更可靠）
+                    if (sLastOriginalPath != null) {
+                        overwriteTempWithOriginal(temp, sLastOriginalPath);
                     }
+                } catch (Throwable ignored) {
+                }
                 }
             });
             log("已挂载 朋友圈复制法（原图覆盖上传临时文件，v7.7）");
@@ -560,14 +567,67 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    /** 是否「基础临时文件」：pre_temp_sns_live_photo<32位hash>，不含 _parse/_remux/_thumb 后缀 */
-    private static boolean isBaseTemp(String path) {
+    /**
+     * v7.8 朋友圈缩放探测：定位微信「内存降采样」入口。
+     * v7.7 复制法对实况图无效——日志实锤 base temp 在 SnsUploadUI.onCreate 就已是原图大小，
+     * 发表时微信在内存里把原图降采样后直接上传，根本不落我们能覆盖的临时文件。
+     * 因此真正的画质开关是「让微信自己决定不降采样」，而这依赖 send_raw_img 键。
+     * 本探测 hook Bitmap.createScaledBitmap / ThumbnailUtils.extractThumbnail，
+     * 在 sns 上下文、源图较大时打印 源尺寸→目标尺寸，便于 v7.8 若注入仍压缩时精准定位压缩函数。
+     * 仅「朋友圈上传原图」开启时挂载，限次 10，普通缩略图忽略，开关关闭零开销。
+     */
+    private void installMomentsScaleProbe() {
+        XC_MethodHook scale = new XC_MethodHook() {
+            private int logged = 0;
+            @Override
+            protected void afterHookedMethod(MethodHookParam p) {
+                if (!cMomentsRaw || logged >= 10) return;
+                try {
+                    android.graphics.Bitmap src = (android.graphics.Bitmap) p.args[0];
+                    if (src == null || src.isRecycled()) return;
+                    int sw = src.getWidth(), sh = src.getHeight();
+                    if (sw * sh < 100000) return;   // 只关心上传级大图降采样
+                    int dw = (Integer) p.args[1];
+                    int dh = (Integer) p.args[2];
+                    logged++;
+                    log("★ [朋友圈缩放探测] 源=" + sw + "x" + sh
+                            + " -> 目标=" + dw + "x" + dh + "  " + p.method.getName());
+                } catch (Throwable ignored) {
+                }
+            }
+        };
+        try {
+            XposedHelpers.findAndHookMethod(android.graphics.Bitmap.class, "createScaledBitmap",
+                    android.graphics.Bitmap.class, int.class, int.class, boolean.class, scale);
+            log("已挂载 Bitmap.createScaledBitmap 缩放探测");
+        } catch (Throwable t) {
+            log("hook createScaledBitmap 失败: " + t);
+        }
+        try {
+            XposedHelpers.findAndHookMethod(android.media.ThumbnailUtils.class, "extractThumbnail",
+                    android.graphics.Bitmap.class, int.class, int.class, scale);
+            XposedHelpers.findAndHookMethod(android.media.ThumbnailUtils.class, "extractThumbnail",
+                    android.graphics.Bitmap.class, int.class, int.class, int.class, scale);
+            log("已挂载 ThumbnailUtils.extractThumbnail 缩放探测");
+        } catch (Throwable t) {
+            log("hook ThumbnailUtils 失败: " + t);
+        }
+    }
+
+    /** 是否「图片类临时文件」：pre_temp_sns_live_photo* 中、排除纯视频 remux（无 _thumb 后缀） */
+    private static boolean isImageTemp(String path) {
         if (path == null) return false;
         String name = new File(path).getName();
         if (!name.startsWith("pre_temp_sns_live_photo")) return false;
-        String tail = name.substring("pre_temp_sns_live_photo".length());
-        // 仅允许纯 32 位十六进制 hash（即基础文件）；带其它后缀的是派生文件，不动
-        return tail.matches("[0-9a-fA-F]{32}");
+        // 纯视频 remux（pre_temp_sns_live_photo_remux_<32hex>，无 _thumb）= 实况的视频流，
+        // 不能用原图覆盖；其余（base / _parse_<hash> / _remux_thumb_<hash>）都是图片，可覆盖。
+        return !name.matches("pre_temp_sns_live_photo_remux_[0-9a-fA-F]{32}");
+    }
+
+    /** 是否纯视频 remux（实况视频流），复制法必须跳过，否则会把视频写成图片字节 */
+    private static boolean isVideoRemux(String path) {
+        if (path == null) return false;
+        return new File(path).getName().matches("pre_temp_sns_live_photo_remux_[0-9a-fA-F]{32}");
     }
 
     /** 把原图覆盖进朋友圈上传临时文件（复制法核心动作）。一次成功即停，避免反复写。 */
@@ -684,6 +744,11 @@ public class MainHook implements IXposedHookLoadPackage {
         sReportedOnce = true;
 
         if (!gallery) return;     // 非相册界面：仅心跳，不做 extras 验证
+
+        // 微信相册选择界面（非 SnsUploadUI 发布界面）：修复「原图」与「制作视频」按钮重叠
+        if (cMomentsRaw && !moments) {
+            fixMomentsButtonOverlap(act);
+        }
 
         // 相册 / 朋友圈发布界面：把实际生效的 extras 打出来
         dumpIntentExtras(act, moments);
@@ -812,6 +877,96 @@ public class MainHook implements IXposedHookLoadPackage {
     private static boolean isMomentsPublisher(String cls) {
         if (cls == null) return false;
         return cls.toLowerCase(Locale.US).contains("snsupload");
+    }
+
+    // ══════════════════════ 微信 UI 修复（重叠）══════════════════════
+
+    /**
+     * 修复微信相册选择界面「原图」与「制作视频」按钮重叠。
+     * 根因：模块在相册里强制 key_force_show_raw_image_button=true，让微信渲染出「原图」按钮，
+     * 它和「制作视频」按钮在同一个底栏撞在一起。本方法在布局完成后把「原图」左移；
+     * 若已贴左仍重叠，则把「制作视频」右移。纯视觉、try/catch 包裹，仅 cMomentsRaw 开启时执行。
+     */
+    private static void fixMomentsButtonOverlap(final Activity act) {
+        final Handler h = ui();
+        if (h == null) return;
+        h.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    View root = act.getWindow().getDecorView();
+                    TextView yuan = findText(root, "原图");
+                    View make = findTextContains(root, "制作视频");
+                    if (yuan == null || make == null) return;  // 两个按钮没同时出现，无需修复
+                    yuan.setTranslationX(0);
+                    make.setTranslationX(0);
+                    int[] rl = new int[2], ml = new int[2];
+                    yuan.getLocationOnScreen(rl);
+                    make.getLocationOnScreen(ml);
+                    int gap = dpAct(act, 8);
+                    int yuanRight = rl[0] + yuan.getWidth();
+                    int makeLeft = ml[0];
+                    if (yuanRight > makeLeft - gap) {
+                        int shift = yuanRight - (makeLeft - gap);   // 需要左移的像素
+                        int minLeft = dpAct(act, 4);
+                        int allowed = rl[0] - minLeft;              // 最多左移到距屏左 4dp
+                        int applied = Math.min(shift, allowed);
+                        if (applied > 0) {
+                            yuan.setTranslationX(-applied);
+                            log("★ [UI] 原图左移 " + applied + "px 以避免与「制作视频」重叠");
+                        } else {
+                            // 原图已贴左，改为把「制作视频」右移
+                            int need = yuanRight - makeLeft + gap;
+                            if (need > 0) {
+                                make.setTranslationX(need);
+                                log("★ [UI] 「制作视频」右移 " + need + "px 以避免与「原图」重叠");
+                            }
+                        }
+                    }
+                } catch (Throwable t) {
+                    log("UI 重叠修复失败: " + t);
+                }
+            }
+        }, 450);
+    }
+
+    private static TextView findText(View v, String exact) {
+        if (v instanceof TextView) {
+            CharSequence t = ((TextView) v).getText();
+            if (t != null && t.toString().trim().equals(exact)) return (TextView) v;
+        }
+        if (v instanceof ViewGroup) {
+            ViewGroup g = (ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) {
+                TextView r = findText(g.getChildAt(i), exact);
+                if (r != null) return r;
+            }
+        }
+        return null;
+    }
+
+    private static View findTextContains(View v, String sub) {
+        if (v instanceof TextView) {
+            CharSequence t = ((TextView) v).getText();
+            if (t != null && t.toString().contains(sub)) return v;
+        }
+        if (v instanceof ViewGroup) {
+            ViewGroup g = (ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) {
+                View r = findTextContains(g.getChildAt(i), sub);
+                if (r != null) return r;
+            }
+        }
+        return null;
+    }
+
+    private static int dpAct(Activity act, int v) {
+        try {
+            return (int) TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v,
+                    act.getResources().getDisplayMetrics());
+        } catch (Throwable t) {
+            return v * 3;
+        }
     }
 
     // ══════════════════════ View 树 dump（诊断用）══════════════════════
