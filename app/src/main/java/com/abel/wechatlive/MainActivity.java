@@ -6,7 +6,6 @@ import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
-import android.content.pm.ComponentName;
 import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.graphics.Color;
@@ -395,13 +394,33 @@ public class MainActivity extends Activity {
     }
 
     // ── 桌面图标隐藏 / 恢复 ──
+    // 注意：CI 编译环境的 android.jar 偶发缺失 android.content.pm.ComponentName 符号
+    // （Xposed API 桩部分遮蔽了 android.content.pm 包）。用反射构造 ComponentName 并
+    // 调用 set/getComponentEnabledSetting，彻底绕开编译期符号依赖；运行时机型必然有该类。
+
+    private static final int ENABLED_STATE = 1;   // PackageManager.COMPONENT_ENABLED_STATE_ENABLED
+    private static final int DISABLED_STATE = 2;  // PackageManager.COMPONENT_ENABLED_STATE_DISABLED
+    private static final int DONT_KILL_APP = 1;   // PackageManager.DONT_KILL_APP
+
+    private Object launcherCn() {
+        try {
+            Class<?> cnClass = Class.forName("android.content.pm.ComponentName");
+            return cnClass.getConstructor(Context.class, String.class)
+                    .newInstance(this, Const.LAUNCHER_ALIAS);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
 
     private boolean isIconHidden() {
         try {
-            PackageManager pm = getPackageManager();
-            ComponentName cn = new ComponentName(this, Const.LAUNCHER_ALIAS);
-            return pm.getComponentEnabledSetting(cn)
-                    == PackageManager.COMPONENT_ENABLED_STATE_DISABLED;
+            Object cn = launcherCn();
+            if (cn == null) return sp().getBoolean(Const.K_ICON_HIDDEN, false);
+            Class<?> cnClass = Class.forName("android.content.pm.ComponentName");
+            Object state = getPackageManager().getClass()
+                    .getMethod("getComponentEnabledSetting", cnClass)
+                    .invoke(getPackageManager(), cn);
+            return DISABLED_STATE == ((Integer) state).intValue();
         } catch (Throwable t) {
             return sp().getBoolean(Const.K_ICON_HIDDEN, false);
         }
@@ -409,12 +428,17 @@ public class MainActivity extends Activity {
 
     private void toggleIcon() {
         try {
-            PackageManager pm = getPackageManager();
-            ComponentName cn = new ComponentName(this, Const.LAUNCHER_ALIAS);
+            Object cn = launcherCn();
+            if (cn == null) {
+                toast("组件名构造失败");
+                return;
+            }
             boolean hidden = isIconHidden();
-            int next = hidden ? PackageManager.COMPONENT_ENABLED_STATE_ENABLED
-                    : PackageManager.COMPONENT_ENABLED_STATE_DISABLED;
-            pm.setComponentEnabledSetting(cn, next, PackageManager.DONT_KILL_APP);
+            Class<?> cnClass = Class.forName("android.content.pm.ComponentName");
+            getPackageManager().getClass()
+                    .getMethod("setComponentEnabledSetting", cnClass, int.class, int.class)
+                    .invoke(getPackageManager(), cn,
+                            hidden ? ENABLED_STATE : DISABLED_STATE, DONT_KILL_APP);
             sp().edit().putBoolean(Const.K_ICON_HIDDEN, !hidden).apply();
             toast(hidden ? "桌面图标已恢复" : "桌面图标已隐藏（拨号 *#*#" + Const.SECRET_CODE + "#*#* 找回）");
             render();

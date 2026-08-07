@@ -3,8 +3,6 @@ package com.abel.wechatlive;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
-import android.content.pm.ComponentName;
-import android.content.pm.PackageManager;
 
 /**
  * 隐藏桌面图标后的「找回」入口。
@@ -27,11 +25,16 @@ public class SecretCodeReceiver extends BroadcastReceiver {
         if (u == null || !Const.SECRET_CODE.equals(u.getHost())) return;
 
         try {
-            PackageManager pm = context.getPackageManager();
-            ComponentName cn = new ComponentName(context, Const.LAUNCHER_ALIAS);
-            pm.setComponentEnabledSetting(cn,
-                    PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
-                    PackageManager.DONT_KILL_APP);
+            // 反射构造 ComponentName 并启用（绕开 CI 编译环境 android.jar 缺失该符号的问题）
+            Class<?> cnClass = Class.forName("android.content.pm.ComponentName");
+            Object cn = cnClass.getConstructor(Context.class, String.class)
+                    .newInstance(context, Const.LAUNCHER_ALIAS);
+            Object pm = context.getPackageManager();
+            pm.getClass()
+                    .getMethod("setComponentEnabledSetting", cnClass, int.class, int.class)
+                    .invoke(pm, cn,
+                            1 /* COMPONENT_ENABLED_STATE_ENABLED */,
+                            1 /* DONT_KILL_APP */);
         } catch (Throwable ignored) {
         }
 
