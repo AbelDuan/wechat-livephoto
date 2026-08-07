@@ -132,9 +132,9 @@ public class MainActivity extends Activity {
         cbEnabled = addCheck(box, Const.K_ENABLED, true,
                 "启用模块（总开关，关闭=暂停一切操作）");
         cbLive = addCheck(box, Const.K_LIVE, true,
-                "自动勾选「实况」");
+                "默认开启「实况」(Gallery_LivePhoto_Auto_Enable)");
         cbOrig = addCheck(box, Const.K_ORIG, true,
-                "自动勾选「原图」");
+                "默认开启「原图」(send_raw_img)");
         cbVerbose = addCheck(box, Const.K_VERBOSE, true,
                 "详细日志（导出 View 树，排障用）");
 

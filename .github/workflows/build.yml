@@ -42,6 +42,33 @@ jobs:
           sys.exit(1 if bad else 0)
           PY
 
+      # LSPosed 在 zygote 里 Class.newInstance() 实例化模块入口类，此时
+      # Looper.getMainLooper() 还是 null。入口类的静态初始化只要碰到
+      # Handler/Looper/Context 就会 ExceptionInInitializerError，
+      # 整个模块在所有进程加载失败 —— 症状是「装了、勾了、但毫无反应且零日志」(v4 的原因)。
+      - name: Guard - entry class static init must not touch Android runtime
+        run: |
+          python3 - <<'PY'
+          import re, sys, pathlib
+          src = pathlib.Path('app/src/main/java/com/abel/wechatlive/MainHook.java').read_text(encoding='utf-8')
+          code = re.sub(r'/\*.*?\*/', '', src, flags=re.S)
+          code = re.sub(r'//[^\n]*', '', code)
+          # 静态字段声明里直接构造 Android 运行时对象
+          PAT = re.compile(
+              r'static\s+(?:final\s+)?[A-Za-z0-9_.<>\[\]]+\s+\w+\s*=\s*'
+              r'(?:new\s+(?:Handler|HandlerThread)\b|Looper\.|.*getMainLooper\(\))')
+          bad = False
+          for i, line in enumerate(code.splitlines(), 1):
+              if PAT.search(line):
+                  print('::error::MainHook.java:%d 静态初始化触碰 Android 运行时，'
+                        'zygote 阶段必崩 -> %s' % (i, line.strip()))
+                  bad = True
+          if re.search(r'static\s*\{', code):
+              print('::warning::MainHook 存在 static{} 块，请人工确认未触碰 Handler/Looper/Context')
+          print('OK: 入口类静态初始化是 zygote 安全的' if not bad else 'GUARD FAILED')
+          sys.exit(1 if bad else 0)
+          PY
+
       - name: Build debug APK (auto-signed with debug key)
         uses: gradle/gradle-build-action@v3
         with:
