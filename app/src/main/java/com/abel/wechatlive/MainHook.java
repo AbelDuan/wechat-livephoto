@@ -82,6 +82,10 @@ public class MainHook implements IXposedHookLoadPackage {
     private static String sProc = "?";
     private static long sLastReport = 0L;
     private static int sForceCount = 0;
+    // 当前前台 Activity 类名（onCreate/onResume 时更新，用于上下文感知强制）
+    private static volatile String sCurrentActivity;
+    // 是否已成功上报过一次（首次用于证明注入，之后只在相册界面心跳）
+    private static volatile boolean sReportedOnce = false;
 
     // 微信版本号缓存（首次 onResume 时从 PackageManager 取，避免每次查询）
     private static String sWxVer;
@@ -135,6 +139,10 @@ public class MainHook implements IXposedHookLoadPackage {
             if (K_LIVE_QUERY.equals(key)) return Boolean.TRUE;
         }
         if (cOrig) {
+            // 原图按钮/原图开关：朋友圈发布界面(SnsUploadUI)排除。
+            // 朋友圈布局没有为「原图」预留位置，强制会出现与「制作视频」重叠的幽灵按钮；
+            // 且 send_raw_img 在朋友圈流程未必改变压缩画质。仅相册/聊天发送流程强开。
+            if (isMomentsPublisher(sCurrentActivity)) return null;
             if (K_SEND_RAW.equals(key)) return Boolean.TRUE;
             if (K_SHOW_RAW_BTN.equals(key)) return Boolean.TRUE;
         }
@@ -238,6 +246,23 @@ public class MainHook implements IXposedHookLoadPackage {
     // ═══════════════════ 生命周期：心跳 + 验证 ═══════════════════
 
     private void installLifecycle() {
+        // onCreate 时尽早记录前台 Activity（早于 onResume），用于上下文感知强制，
+        // 避免朋友圈发布界面在 onCreate 阶段就被误强制出幽灵原图按钮
+        try {
+            XposedHelpers.findAndHookMethod(Activity.class, "onCreate", Bundle.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                sCurrentActivity = param.thisObject.getClass().getName();
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    });
+            log("已挂载 Activity#onCreate");
+        } catch (Throwable t) {
+            log("挂载 Activity#onCreate 失败: " + t);
+        }
         try {
             XposedHelpers.findAndHookMethod(Activity.class, "onResume", new XC_MethodHook() {
                 @Override
@@ -258,13 +283,18 @@ public class MainHook implements IXposedHookLoadPackage {
     private static void onResume(final Activity act) {
         if (act == null) return;
         final String cls = act.getClass().getName();
+        sCurrentActivity = cls;   // 记录前台 Activity（供上下文感知强制使用）
         log("onResume [" + sProc + "] " + cls);
 
+        if (!cEnabled) return;
+        boolean gallery = looksLikeGallery(cls);
+        // 更极致：非相册界面不心跳；仅首次 onResume 上报一次以证明注入成功
+        if (!gallery && sReportedOnce) return;
         // 心跳 + 拉取开关（后台线程，不阻塞微信主线程）
         report(act.getApplicationContext(), cls);
+        sReportedOnce = true;
 
-        if (!cEnabled) return;
-        if (!looksLikeGallery(cls)) return;
+        if (!gallery) return;     // 非相册界面：仅心跳，不做 extras 验证
 
         // 相册界面：把实际生效的 extras 打出来，直接验证强制是否成功
         dumpIntentExtras(act);
@@ -312,6 +342,12 @@ public class MainHook implements IXposedHookLoadPackage {
         if (cls == null) return false;
         String l = cls.toLowerCase(Locale.US);
         return l.contains("gallery") || l.contains("album") || l.contains("imagepreview");
+    }
+
+    /** 朋友圈发布界面（com.tencent.mm.plugin.sns.ui.SnsUploadUI 等） */
+    private static boolean isMomentsPublisher(String cls) {
+        if (cls == null) return false;
+        return cls.toLowerCase(Locale.US).contains("snsupload");
     }
 
     // ══════════════════════ View 树 dump（诊断用）══════════════════════
