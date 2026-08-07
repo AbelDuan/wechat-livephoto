@@ -6,6 +6,8 @@ import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.ComponentName;
+import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.graphics.Color;
 import android.graphics.Typeface;
@@ -56,7 +58,8 @@ public class MainActivity extends Activity {
     private TextView statusView;
     private TextView detailView;
     private TextView logView;
-    private CheckBox cbEnabled, cbLive, cbOrig, cbVerbose;
+    private CheckBox cbEnabled, cbLive, cbOrig, cbVerbose, cbLog;
+    private Button iconBtn;
 
     private final Handler ticker = new Handler(Looper.getMainLooper());
     private final Runnable tick = new Runnable() {
@@ -141,6 +144,8 @@ public class MainActivity extends Activity {
                 "默认开启「原图」(send_raw_img)");
         cbVerbose = addCheck(box, Const.K_VERBOSE, false,
                 "详细日志（导出 View 树，排障用；默认关，省电）");
+        cbLog = addCheck(box, Const.K_LOG, false,
+                "日志记录（排障/导出用，默认关闭，省电）");
 
         root.addView(box, mw());
 
@@ -180,6 +185,40 @@ public class MainActivity extends Activity {
         });
         exportBtn.setPadding(dp(8), dp(10), dp(8), dp(10));
         root.addView(exportBtn, mw());
+
+        // ── 桌面图标（可隐藏，隐藏后用拨号暗码找回）──
+        TextView iconHead = new TextView(this);
+        iconHead.setText("桌面图标");
+        iconHead.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        iconHead.setTypeface(Typeface.DEFAULT_BOLD);
+        iconHead.setTextColor(Color.parseColor("#222222"));
+        iconHead.setPadding(dp(4), dp(10), dp(4), dp(2));
+        root.addView(iconHead, mw());
+
+        LinearLayout iconBox = new LinearLayout(this);
+        iconBox.setOrientation(LinearLayout.VERTICAL);
+        iconBox.setBackgroundColor(Color.WHITE);
+        iconBox.setPadding(dp(10), dp(6), dp(10), dp(6));
+
+        iconBtn = btn("隐藏桌面图标", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                toggleIcon();
+            }
+        });
+        iconBtn.setPadding(dp(8), dp(10), dp(8), dp(10));
+        iconBox.addView(iconBtn, mw());
+
+        TextView iconHint = new TextView(this);
+        iconHint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        iconHint.setTextColor(Color.parseColor("#888888"));
+        iconHint.setPadding(dp(2), dp(6), dp(2), dp(2));
+        iconHint.setText("隐藏后桌面不再显示本应用。找回方式：\n"
+                + "① 拨号盘输入 *#*#" + Const.SECRET_CODE + "#*#* 自动重新打开；\n"
+                + "② 或 adb：am start -n " + Const.MODULE_PKG + "/.MainActivity");
+        iconBox.addView(iconHint, mw());
+
+        root.addView(iconBox, mw());
 
         // ── 日志区 ──
         logView = new TextView(this);
@@ -252,6 +291,11 @@ public class MainActivity extends Activity {
                 detailView.setText(detail(seen, age, hits, sp));
             }
 
+            if (iconBtn != null) {
+                iconBtn.setText(isIconHidden()
+                        ? "显示桌面图标（当前已隐藏）" : "隐藏桌面图标");
+            }
+
             List<String> lines = LogStore.tail(this, 400);
             if (lines.isEmpty()) {
                 logView.setText("（暂无日志）\n\n"
@@ -317,7 +361,11 @@ public class MainActivity extends Activity {
         try {
             String content = LogStore.readFully(this);
             if (content == null || content.length() == 0) {
-                toast("日志为空，暂无可导出内容");
+                if (!sp().getBoolean(Const.K_LOG, false)) {
+                    toast("日志记录当前为关闭，导出内容为空；如需完整日志请先开启「日志记录」");
+                } else {
+                    toast("日志为空，暂无可导出内容");
+                }
                 return;
             }
             File dir = getExternalFilesDir(null);
@@ -343,6 +391,35 @@ public class MainActivity extends Activity {
             toast("已导出到 " + out.getAbsolutePath());
         } catch (Throwable t) {
             toast("导出失败：" + t.getClass().getSimpleName());
+        }
+    }
+
+    // ── 桌面图标隐藏 / 恢复 ──
+
+    private boolean isIconHidden() {
+        try {
+            PackageManager pm = getPackageManager();
+            ComponentName cn = new ComponentName(this, Const.LAUNCHER_ALIAS);
+            return pm.getComponentEnabledSetting(cn)
+                    == PackageManager.COMPONENT_ENABLED_STATE_DISABLED;
+        } catch (Throwable t) {
+            return sp().getBoolean(Const.K_ICON_HIDDEN, false);
+        }
+    }
+
+    private void toggleIcon() {
+        try {
+            PackageManager pm = getPackageManager();
+            ComponentName cn = new ComponentName(this, Const.LAUNCHER_ALIAS);
+            boolean hidden = isIconHidden();
+            int next = hidden ? PackageManager.COMPONENT_ENABLED_STATE_ENABLED
+                    : PackageManager.COMPONENT_ENABLED_STATE_DISABLED;
+            pm.setComponentEnabledSetting(cn, next, PackageManager.DONT_KILL_APP);
+            sp().edit().putBoolean(Const.K_ICON_HIDDEN, !hidden).apply();
+            toast(hidden ? "桌面图标已恢复" : "桌面图标已隐藏（拨号 *#*#" + Const.SECRET_CODE + "#*#* 找回）");
+            render();
+        } catch (Throwable t) {
+            toast("操作失败：" + t.getClass().getSimpleName());
         }
     }
 

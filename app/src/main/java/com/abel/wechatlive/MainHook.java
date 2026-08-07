@@ -94,6 +94,8 @@ public class MainHook implements IXposedHookLoadPackage {
     private static volatile boolean cOrig = true;
     // 详细日志(导出 View 树)默认关闭——这是最大的功耗点，排障时再打开
     private static volatile boolean cVerbose = false;
+    // 日志记录(写入 App 文件，供导出/排查)默认关闭——省电，心跳自检不受影响
+    private static volatile boolean cLog = false;
 
     // ⚠️ 绝不能是 static final 直接 new —— 见类注释
     private static volatile Handler sHandler;
@@ -380,6 +382,7 @@ public class MainHook implements IXposedHookLoadPackage {
                         cLive = out.getBoolean(Const.K_LIVE, true);
                         cOrig = out.getBoolean(Const.K_ORIG, true);
                         cVerbose = out.getBoolean(Const.K_VERBOSE, false);
+                        cLog = out.getBoolean(Const.K_LOG, false);
                     }
                 } catch (Throwable t) {
                     // 模块 App 被冻结/未安装时会走到这里，忽略即可
@@ -430,6 +433,8 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     private static void log(String msg) {
+        // 主开关：日志记录默认关闭，省电。心跳/强制计数不受影响（走独立通道）。
+        if (!cLog) return;
         String line = stamp() + "  " + msg;
         try {
             android.util.Log.i(TAG, line);

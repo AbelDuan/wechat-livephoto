@@ -34,6 +34,8 @@ public final class Const {
     public static final String K_ORIG = "auto_orig";
     /** 用户开关：详细日志（dump View 树） */
     public static final String K_VERBOSE = "verbose";
+    /** 用户开关：日志记录（写入 App 私有文件，排障/导出用，默认关闭省电） */
+    public static final String K_LOG = "enable_log";
 
     /** 状态：最近一次微信侧回报的时间戳 */
     public static final String K_LAST_SEEN = "last_seen";
@@ -43,6 +45,13 @@ public final class Const {
     public static final String K_WX_VER = "wx_ver";
     /** 状态：回报累计次数 */
     public static final String K_HITS = "hits";
+    /** 状态：桌面图标是否被隐藏 */
+    public static final String K_ICON_HIDDEN = "icon_hidden";
+
+    /** 桌面图标的 activity-alias 全名（隐藏/恢复图标用） */
+    public static final String LAUNCHER_ALIAS = "com.abel.wechatlive.LauncherEntry";
+    /** 隐藏图标后的恢复暗码（拨号盘输入 *#*#7356#*#*） */
+    public static final String SECRET_CODE = "7356";
 
     public static final String LOG_FILE = "hook.log";
     /** 日志文件超过此大小后截断保留后半段 */

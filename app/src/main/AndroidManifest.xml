@@ -9,17 +9,29 @@
     <application
         android:allowBackup="true"
         android:label="WechatLive"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
         android:supportsRtl="true">
 
+        <!-- 真正的入口 Activity：不带 LAUNCHER 过滤器，靠下面的 alias 进桌面 -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:label="WechatLive">
+            android:label="WechatLive" />
+
+        <!-- 桌面启动入口（可隐藏）。隐藏图标 = 禁用这个 alias，Activity 本体不受影响 -->
+        <activity-alias
+            android:name=".LauncherEntry"
+            android:targetActivity=".MainActivity"
+            android:exported="true"
+            android:enabled="true"
+            android:label="WechatLive"
+            android:icon="@mipmap/ic_launcher">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-        </activity>
+        </activity-alias>
 
         <!--
           状态通道：微信进程内的 Hook 通过它回报心跳/日志，并取回用户设置的开关。
@@ -38,6 +50,16 @@
             android:authorities="com.abel.wechatlive.fileprovider"
             android:exported="false"
             android:grantUriPermissions="true" />
+
+        <!-- 隐藏桌面图标后的找回入口：拨号盘输入 *#*#7356#*#* -->
+        <receiver
+            android:name=".SecretCodeReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.provider.Telephony.SECRET_CODE" />
+                <data android:scheme="android_secret_code" android:host="7356" />
+            </intent-filter>
+        </receiver>
 
         <!-- ===== LSPosed / Xposed 模块声明 ===== -->
         <meta-data
