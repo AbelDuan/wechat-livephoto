@@ -102,41 +102,46 @@ public class MainActivity extends Activity {
     // ────────────────────────────── UI ──────────────────────────────
 
     private void buildUi() {
-        // 最外层可滚动容器：所有内容（状态/开关/按钮/日志）都能滚动查看，
-        // 不再因屏幕矮而被挤掉。日志区给固定高度 + 内部滚动，永不被压成一行。
-        ScrollView outer = new ScrollView(this);
-        outer.setBackgroundColor(Color.parseColor("#F5F6F8"));
-        outer.setFillViewport(true);
-
+        // 根布局：竖向 LinearLayout，整体不滚动。
+        // 上「控制区」与下「日志区」是两个【兄弟】ScrollView，各自独立滚动、互不嵌套——
+        // 之前把日志 TextView 嵌在外层 ScrollView 里，父 ScrollView 抢走了竖向滑动手势，
+        // 导致日志永远滑不动。拆成兄弟节点后，日志区可以正常用手指上下滑动。
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
+        root.setBackgroundColor(Color.parseColor("#F5F6F8"));
         int p = dp(16);
         root.setPadding(p, dp(12), p, dp(10));
-        outer.addView(root, new ScrollView.LayoutParams(
+
+        // ── 上方控制区（独立 ScrollView，weight=1 占满剩余空间）──
+        ScrollView top = new ScrollView(this);
+        top.setFillViewport(false);
+        LinearLayout topInner = new LinearLayout(this);
+        topInner.setOrientation(LinearLayout.VERTICAL);
+        top.addView(topInner, new ScrollView.LayoutParams(
                 ScrollView.LayoutParams.MATCH_PARENT, ScrollView.LayoutParams.WRAP_CONTENT));
 
-        // ── 状态横幅 ──
+        // 状态横幅
         statusView = new TextView(this);
         statusView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 17);
         statusView.setTypeface(Typeface.DEFAULT_BOLD);
         statusView.setGravity(Gravity.CENTER);
         statusView.setPadding(dp(14), dp(16), dp(14), dp(16));
-        root.addView(statusView, mw());
+        topInner.addView(statusView, mw());
 
         detailView = new TextView(this);
         detailView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
         detailView.setTextColor(Color.parseColor("#555555"));
         detailView.setPadding(dp(4), dp(10), dp(4), dp(6));
-        root.addView(detailView, mw());
+        topInner.addView(detailView, mw());
 
-        // ── 开关区 ──
+        // 开关区
         TextView head = new TextView(this);
         head.setText("功能开关（改完立即生效，无需重启微信）");
         head.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
         head.setTypeface(Typeface.DEFAULT_BOLD);
         head.setTextColor(Color.parseColor("#222222"));
         head.setPadding(dp(4), dp(8), dp(4), dp(2));
-        root.addView(head, mw());
+        topInner.addView(head, mw());
 
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
@@ -156,9 +161,9 @@ public class MainActivity extends Activity {
         cbLog = addCheck(box, Const.K_LOG, false,
                 "日志记录（排障/导出用，默认关闭，省电）");
 
-        root.addView(box, mw());
+        topInner.addView(box, mw());
 
-        // ── 按钮 ──
+        // 按钮
         LinearLayout bar = new LinearLayout(this);
         bar.setOrientation(LinearLayout.HORIZONTAL);
         bar.setPadding(0, dp(10), 0, dp(6));
@@ -183,9 +188,9 @@ public class MainActivity extends Activity {
                 render();
             }
         }), eq());
-        root.addView(bar, mw());
+        topInner.addView(bar, mw());
 
-        // ── 导出日志（写文件 + 系统分享面板，绕开剪贴板长度限制）──
+        // 导出日志（写文件 + 系统分享面板，绕开剪贴板长度限制）
         Button exportBtn = btn("导出日志（写文件并分享）", new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -193,16 +198,16 @@ public class MainActivity extends Activity {
             }
         });
         exportBtn.setPadding(dp(8), dp(10), dp(8), dp(10));
-        root.addView(exportBtn, mw());
+        topInner.addView(exportBtn, mw());
 
-        // ── 桌面图标（可隐藏，隐藏后用拨号暗码找回）──
+        // 桌面图标（可隐藏，隐藏后用拨号暗码找回）
         TextView iconHead = new TextView(this);
         iconHead.setText("桌面图标");
         iconHead.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
         iconHead.setTypeface(Typeface.DEFAULT_BOLD);
         iconHead.setTextColor(Color.parseColor("#222222"));
         iconHead.setPadding(dp(4), dp(10), dp(4), dp(2));
-        root.addView(iconHead, mw());
+        topInner.addView(iconHead, mw());
 
         LinearLayout iconBox = new LinearLayout(this);
         iconBox.setOrientation(LinearLayout.VERTICAL);
@@ -227,24 +232,29 @@ public class MainActivity extends Activity {
                 + "② 或 adb：am start -n " + Const.MODULE_PKG + "/.MainActivity");
         iconBox.addView(iconHint, mw());
 
-        root.addView(iconBox, mw());
+        topInner.addView(iconBox, mw());
 
-        // ── 日志区（固定高度 + 内部滚动，永不被上方选项挤成一行）──
+        // 上方控制区占满剩余空间（weight=1），内容超高时自行滚动
+        root.addView(top, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        // ── 下方日志区（独立 ScrollView + 固定高度，永不被上方选项挤成一行）──
+        ScrollView logSv = new ScrollView(this);
+        logSv.setBackgroundColor(Color.WHITE);
+        logSv.setPadding(dp(8), dp(8), dp(8), dp(8));
         logView = new TextView(this);
         logView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
         logView.setTextColor(Color.parseColor("#2E2E2E"));
         logView.setTypeface(Typeface.MONOSPACE);
-        logView.setBackgroundColor(Color.WHITE);
-        logView.setPadding(dp(8), dp(8), dp(8), dp(8));
-        // 内部纵向滚动，让它在本固定高度盒子里显示全部日志（不依赖外层滚动，也不被裁剪）
-        logView.setMovementMethod(new ScrollingMovementMethod());
-        logView.setVerticalScrollBarEnabled(true);
+        logView.setTextIsSelectable(true);
+        logSv.addView(logView, new ScrollView.LayoutParams(
+                ScrollView.LayoutParams.MATCH_PARENT, ScrollView.LayoutParams.WRAP_CONTENT));
         LinearLayout.LayoutParams logLp = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(340));
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(300));
         logLp.setMargins(0, dp(10), 0, 0);
-        root.addView(logView, logLp);
+        root.addView(logSv, logLp);
 
-        setContentView(outer);
+        setContentView(root);
     }
 
     private CheckBox addCheck(LinearLayout parent, final String key,

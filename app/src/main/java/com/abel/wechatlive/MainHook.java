@@ -115,7 +115,7 @@ public class MainHook implements IXposedHookLoadPackage {
         sProc = lp.processName;
 
         log("========================================");
-        log("WechatLive v7.3 注入成功  proc=" + sProc);
+        log("WechatLive v7.4 注入成功  proc=" + sProc);
 
         // 相册只在主进程，重量级 hook 只装主进程，避免 :push/:appbrand 等无谓开销
         boolean main = Const.WECHAT_PKG.equals(sProc);
@@ -126,6 +126,7 @@ public class MainHook implements IXposedHookLoadPackage {
 
         installExtraForcing();
         installLifecycle();
+        installCompressProbe();
     }
 
     // ═══════════════ 核心：改写 Intent / Bundle 里的开关键 ═══════════════
@@ -285,6 +286,59 @@ public class MainHook implements IXposedHookLoadPackage {
             log("已挂载 Activity#onResume");
         } catch (Throwable t) {
             log("挂载 Activity#onResume 失败: " + t);
+        }
+    }
+
+    /**
+     * 朋友圈原图探测（诊断用，仅「详细日志」开启时生效）：
+     * 微信发朋友圈时会对大图做压缩再上传，真正的画质入口在压缩/编码阶段，
+     * 不在 Intent extras（日志已实锤 SnsUploadUI 的 extras 无原图键）。
+     * 这里 hook Bitmap.compress，当「面积较大（上传级）且调用栈来自 plugin.sns」时，
+     * 打印完整调用栈——下一次开启详细日志、进朋友圈点发送后导出的日志里，
+     * 就能看到微信压缩图片的具体类名/方法，据此实现「复制法/转换法」真正绕过压缩。
+     * 该 hook 只读、不改，且带面积阈值 + 次数上限，默认（详细日志关闭）零开销。
+     */
+    private void installCompressProbe() {
+        try {
+            XposedHelpers.findAndHookMethod(android.graphics.Bitmap.class,
+                    "compress",
+                    android.graphics.Bitmap.CompressFormat.class,
+                    int.class,
+                    java.io.OutputStream.class,
+                    new XC_MethodHook() {
+                        private int logged = 0;
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam p) {
+                            if (!cVerbose || logged >= 8) return;
+                            try {
+                                android.graphics.Bitmap bmp = (android.graphics.Bitmap) p.thisObject;
+                                int area = bmp.getWidth() * bmp.getHeight();
+                                if (area < 500000) return; // 只关心上传级大图压缩，忽略缩略图
+                                StackTraceElement[] st = new Throwable().getStackTrace();
+                                boolean sns = false;
+                                StringBuilder sb = new StringBuilder();
+                                for (StackTraceElement e : st) {
+                                    String cn = e.getClassName();
+                                    if (cn.contains("plugin.sns") || cn.contains(".sns.")
+                                            || cn.endsWith(".sns.ui") || cn.contains("sns.model")) {
+                                        sns = true;
+                                    }
+                                    if (sb.length() < 1400) {
+                                        sb.append("\n    ").append(cn).append('.').append(e.getMethodName());
+                                    }
+                                    if (sb.length() >= 1400) break;
+                                }
+                                if (!sns) return;
+                                logged++;
+                                log("★ [朋友圈压缩探测] Bitmap.compress 面积=" + area
+                                        + " quality=" + p.args[1] + " 调用栈(top→底):" + sb);
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    });
+            log("已挂载 Bitmap.compress 朋友圈压缩探测（开启「详细日志」后，发朋友圈可抓压缩栈）");
+        } catch (Throwable t) {
+            log("挂载 Bitmap.compress 探测失败: " + t);
         }
     }
 
