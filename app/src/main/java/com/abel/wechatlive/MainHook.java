@@ -144,6 +144,13 @@ public class MainHook implements IXposedHookLoadPackage {
     private static volatile long sSweepAt = 0L;        // 上次安排核验的时间，去重
     private static volatile boolean sSweeping = false; // 核验中：防止自身 IO 触发探针递归
     private static volatile int sSweepLogged = 0;      // 核验日志限次
+    // v8.4 关键：temp → 该 temp 对应的原图。核验必须按这张映射回写，
+    //      绝不能再用 findOriginalForDims 按尺寸重查——多图同尺寸时会全部命中同一张，
+    //      把已正确的文件覆盖成别人的照片（v8.3 实测九宫格出现重复图）。
+    private static final Map<String, String> sTempOrig = new HashMap<String, String>();
+    // v8.4：进入相册前的来源界面。用于区分「朋友圈选图」与「聊天选图」——
+    //      两者共用 AlbumPreviewUI，仅靠当前 Activity 类名无法分辨。
+    private static volatile String sLastNonGallery = "";
 
     private static String sProc = "?";
     private static long sLastReport = 0L;
@@ -181,7 +188,7 @@ public class MainHook implements IXposedHookLoadPackage {
         sProc = lp.processName;
 
         log("========================================");
-        log("WechatLive v8.3 注入成功  proc=" + sProc);
+        log("WechatLive v8.4 注入成功  proc=" + sProc);
 
         // 相册只在主进程，重量级 hook 只装主进程，避免 :push/:appbrand 等无谓开销
         boolean main = Const.WECHAT_PKG.equals(sProc);
@@ -989,6 +996,14 @@ public class MainHook implements IXposedHookLoadPackage {
                                     + " 与原图 " + shortPath(orig) + " 字节完全一致 " + safeSize(temp)
                                     + "B（微信原图模式已生效）第" + sRawSame + "次");
                         }
+                        // v8.4：把「此刻已验证正确」的 temp→原图 配对钉死。
+                        // 后续核验只认这张表——绝不再按尺寸重查（多图同尺寸会串到同一张，
+                        // v8.3 因此把正确的图覆盖成了别人的照片）。
+                        if (r == COPY_WRITTEN || r == COPY_SAME) {
+                            synchronized (sTempOrig) {
+                                if (sTempOrig.size() < 64) sTempOrig.put(temp, orig);
+                            }
+                        }
                         // 微信有可能在流关闭之后再重编码一次，安排一次延迟核验兜底
                         rememberDraftDir(temp);
                         scheduleSweep();
@@ -1361,8 +1376,18 @@ public class MainHook implements IXposedHookLoadPackage {
                         if (len < 1024) continue;
                         int[] wh = boundsOf(path);
                         if (wh == null) continue;
-                        String orig = findOriginalForDims(wh[0], wh[1]);
-                        if (orig == null) continue;
+                        // v8.4：只认注入时钉下的配对。按尺寸重查会张冠李戴（见 sTempOrig 注释）。
+                        String orig;
+                        synchronized (sTempOrig) { orig = sTempOrig.get(path); }
+                        if (orig == null) {
+                            // 没有配对记录 = 这个文件不是我们经手的，只观测不回写，避免误伤。
+                            if (sSweepLogged < 10) {
+                                sSweepLogged++;
+                                log("★ [产物核验] " + shortPath(path) + " " + wh[0] + "x" + wh[1]
+                                        + " " + len + "B 无配对记录，跳过回写（仅观测）");
+                            }
+                            continue;
+                        }
                         long ol = new File(orig).length();
                         if (sSweepLogged >= 10) continue;
                         sSweepLogged++;
@@ -1372,7 +1397,7 @@ public class MainHook implements IXposedHookLoadPackage {
                         } else {
                             int r = overwriteTempWithOriginal(path, orig);
                             log("★ [产物核验] " + shortPath(path) + " " + wh[0] + "x" + wh[1]
-                                    + " 被重编码 " + len + "B ≠ 原图 " + ol + "B → "
+                                    + " 被重编码 " + len + "B ≠ 原图 " + shortPath(orig) + " " + ol + "B → "
                                     + (r == COPY_WRITTEN ? "已回写原图 ✓" : "回写失败 ✗"));
                         }
                     } catch (Throwable ignored) {
@@ -1460,6 +1485,9 @@ public class MainHook implements IXposedHookLoadPackage {
         if (!cEnabled) return;
         boolean gallery = looksLikeGallery(cls);
         boolean moments = isMomentsPublisher(cls);
+        // v8.4：相册界面(AlbumPreviewUI)聊天与朋友圈共用，类名分不出来。
+        //      记住进入相册「之前」停留的界面，用它判断本次选图属于哪条流程。
+        if (!gallery) sLastNonGallery = cls;
         // 更极致：非相册界面不心跳；仅首次 onResume 上报一次以证明注入成功
         if (!gallery && sReportedOnce) return;
         // 心跳 + 拉取开关（后台线程，不阻塞微信主线程）
@@ -1468,9 +1496,14 @@ public class MainHook implements IXposedHookLoadPackage {
 
         if (!gallery) return;     // 非相册界面：仅心跳，不做 extras 验证
 
-        // 微信相册选择界面（非 SnsUploadUI 发布界面）：修复「原图」与「制作视频」按钮重叠
-        if (cMomentsRaw && !moments) {
-            fixMomentsButtonOverlap(act);
+        // 微信相册选择界面（非 SnsUploadUI 发布界面）：修复「原图」与「制作视频」按钮重叠。
+        // v8.4：仅朋友圈流程干预。聊天流程主动复位，保证「原图」按钮是微信默认外观。
+        if (!moments) {
+            if (cMomentsRaw && fromMomentsFlow()) {
+                fixMomentsButtonOverlap(act);
+            } else {
+                restoreRawButtonLayout(act);
+            }
         }
 
         // 相册 / 朋友圈发布界面：把实际生效的 extras 打出来
@@ -1635,16 +1668,29 @@ public class MainHook implements IXposedHookLoadPackage {
 
     // ══════════════════════ 微信 UI 修复（重叠）══════════════════════
 
+    /** 本次相册选图是否来自朋友圈流程（相册界面聊天/朋友圈共用，只能靠来源界面区分） */
+    private static boolean fromMomentsFlow() {
+        String s = sLastNonGallery;
+        if (s == null) return false;
+        String l = s.toLowerCase(Locale.US);
+        return l.contains("plugin.sns") || l.contains("sns.ui");
+    }
+
     /**
      * 修复微信相册选择界面「原图」与「制作视频」按钮重叠。
-     * 根因：模块在相册里强制 key_force_show_raw_image_button=true，让微信渲染出「原图」按钮，
-     * 它和「制作视频」按钮在同一个底栏撞在一起。本方法在布局完成后把「原图」左移；
-     * 若已贴左仍重叠，则把「制作视频」右移。纯视觉、try/catch 包裹，仅 cMomentsRaw 开启时执行。
+     *
+     * v8.4 重写。之前两版失败的原因（已由 View 树 + 日志证实）：
+     *  1) 位移对象错了——移动的是「原图」那个纯文字 TextView(km9)，而按钮实际是
+     *     km6 容器里的 [圆圈图标 km5 + 文字 km9]。只移文字 → 文字被 km6 边界裁掉不可见，
+     *     图标纹丝不动，于是「重叠没修好」+「原图二字消失」两个症状同时出现。
+     *  2) 方向错了——「原图」所在的 kmg 与「制作视频」所在的 pn 是两条各自贴底的兄弟栏，
+     *     属于上下堆叠，横向左移再多也不可能分开。
+     * 现在：整体移动按钮容器，并优先做纵向上抬。
      */
     private static void fixMomentsButtonOverlap(final Activity act) {
         final Handler h = ui();
         if (h == null) return;
-        // 「原图」按钮常在勾选图片之后才出现，单次探测会漏 → 多次重试（幂等：每次先复位再计算）
+        // 「原图」按钮常在勾选图片之后才出现，单次探测会漏 → 多次重试（幂等：每次先复位再算）
         for (int delay : new int[]{450, 1200, 2500, 4500}) {
             scheduleOverlapFix(act, h, delay);
         }
@@ -1659,38 +1705,134 @@ public class MainHook implements IXposedHookLoadPackage {
             public void run() {
                 try {
                     View root = act.getWindow().getDecorView();
-                    TextView yuan = findText(root, "原图");
-                    View make = findTextContains(root, "制作视频");
-                    if (yuan == null || make == null) return;  // 两个按钮没同时出现，无需修复
-                    yuan.setTranslationX(0);
-                    make.setTranslationX(0);
-                    int[] rl = new int[2], ml = new int[2];
-                    yuan.getLocationOnScreen(rl);
-                    make.getLocationOnScreen(ml);
-                    int gap = dpAct(act, 8);
-                    int yuanRight = rl[0] + yuan.getWidth();
-                    int makeLeft = ml[0];
-                    if (yuanRight > makeLeft - gap) {
-                        int shift = yuanRight - (makeLeft - gap);   // 总共需要拉开的像素
-                        int minLeft = dpAct(act, 4);
-                        int allowed = Math.max(0, rl[0] - minLeft); // 最多左移到距屏左 4dp
-                        int applied = Math.min(shift, allowed);
-                        int rest = shift - applied;
-                        if (applied > 0) yuan.setTranslationX(-applied);
-                        // 左移空间不足的部分，由「制作视频」右移补足（否则仍会重叠）
-                        if (rest > 0) make.setTranslationX(rest);
-                        // 多次重试会重复计算出同一结果，去重打印避免刷屏
-                        int sig = applied * 100000 + rest;
-                        if (sig != sLastOverlapSig) {
-                            sLastOverlapSig = sig;
-                            log("★ [UI] 修复重叠：原图左移 " + applied + "px，制作视频右移 " + rest + "px");
+                    TextView yuanTv = findText(root, "原图");
+                    View makeTv = findTextContains(root, "制作视频");
+                    if (yuanTv == null || makeTv == null) return;   // 没同时出现，无需修复
+
+                    View yuan = buttonContainerOf(yuanTv);          // 图标+文字的整体容器
+                    View make = buttonContainerOf(makeTv);
+
+                    // 幂等：每轮重试先完全复位，再基于原始布局重新计算
+                    yuanTv.setTranslationX(0); yuanTv.setTranslationY(0);
+                    makeTv.setTranslationX(0); makeTv.setTranslationY(0);
+                    yuan.setTranslationX(0);   yuan.setTranslationY(0);
+                    make.setTranslationX(0);   make.setTranslationY(0);
+
+                    int[] a = rectOf(yuan), b = rectOf(make);
+                    if (a == null || b == null) return;
+                    boolean hit = a[0] < b[2] && b[0] < a[2] && a[1] < b[3] && b[1] < a[3];
+                    if (!hit) {                                     // 不重叠：保持微信默认
+                        if (sLastOverlapSig != 0) {
+                            sLastOverlapSig = 0;
+                            log("★ [UI] 原图/制作视频未重叠，保持默认布局");
                         }
+                        return;
+                    }
+
+                    int gap = dpAct(act, 6);
+                    // 两条栏是上下堆叠 → 纵向把「原图」整体抬到「制作视频」之上，这才是真正的解
+                    int up = a[3] - b[1] + gap;
+                    relaxClip(yuan, 4);                             // 防止上抬后被祖先裁掉
+                    yuan.setTranslationY(-up);
+
+                    int sig = up;
+                    if (sig != sLastOverlapSig) {
+                        sLastOverlapSig = sig;
+                        log("★ [UI] 修复重叠：原图整体上抬 " + up + "px"
+                                + "（原图 " + a[0] + "," + a[1] + "-" + a[2] + "," + a[3]
+                                + "  制作视频 " + b[0] + "," + b[1] + "-" + b[2] + "," + b[3] + "）");
                     }
                 } catch (Throwable t) {
                     log("UI 重叠修复失败: " + t);
                 }
             }
         }, delay);
+    }
+
+    /**
+     * 聊天等非朋友圈流程：把可能残留的位移全部清零，让「原图」按钮回到微信默认外观。
+     * 必要性：相册 Activity 与 View 会被复用，旧版本残留的 translation 会让文字继续隐身。
+     */
+    private static void restoreRawButtonLayout(final Activity act) {
+        final Handler h = ui();
+        if (h == null) return;
+        for (final int delay : new int[]{450, 1500}) {
+            h.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        View root = act.getWindow().getDecorView();
+                        TextView yuanTv = findText(root, "原图");
+                        if (yuanTv == null) return;
+                        View yuan = buttonContainerOf(yuanTv);
+                        boolean dirty = yuanTv.getTranslationX() != 0 || yuanTv.getTranslationY() != 0
+                                || yuan.getTranslationX() != 0 || yuan.getTranslationY() != 0;
+                        yuanTv.setTranslationX(0); yuanTv.setTranslationY(0);
+                        yuan.setTranslationX(0);   yuan.setTranslationY(0);
+                        View makeTv = findTextContains(root, "制作视频");
+                        if (makeTv != null) {
+                            makeTv.setTranslationX(0); makeTv.setTranslationY(0);
+                            View make = buttonContainerOf(makeTv);
+                            make.setTranslationX(0);   make.setTranslationY(0);
+                        }
+                        if (dirty) log("★ [UI] 非朋友圈流程，已复位「原图」按钮为微信默认布局");
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }, delay);
+        }
+    }
+
+    /**
+     * 由标签 TextView 上溯到「整个按钮」的容器：取第一个同时含有图片子视图的祖先。
+     * 微信的原图按钮是 RelativeLayout[ WeImageView 圆圈, TextView "原图" ]，
+     * 只移动 TextView 会让文字脱离图标并被容器裁剪——这正是 v8.1~v8.3 的 bug。
+     */
+    private static View buttonContainerOf(View label) {
+        View cur = label;
+        for (int i = 0; i < 3; i++) {
+            android.view.ViewParent p = cur.getParent();
+            if (!(p instanceof ViewGroup)) break;
+            ViewGroup g = (ViewGroup) p;
+            if (g.getChildCount() > 4) break;        // 太大了，不像单个按钮，停在上一层
+            cur = g;
+            if (hasImageChild(g)) return g;          // 含图标 → 这就是按钮整体
+        }
+        return cur;
+    }
+
+    private static boolean hasImageChild(ViewGroup g) {
+        for (int i = 0; i < g.getChildCount(); i++) {
+            View c = g.getChildAt(i);
+            if (c instanceof android.widget.ImageView) return true;
+            String n = c.getClass().getSimpleName().toLowerCase(Locale.US);
+            if (n.contains("image") || n.contains("checkbox")) return true;
+        }
+        return false;
+    }
+
+    /** 放开祖先的裁剪，避免上抬后的视图被父容器切掉 */
+    private static void relaxClip(View v, int levels) {
+        android.view.ViewParent p = v.getParent();
+        for (int i = 0; i < levels && p instanceof ViewGroup; i++) {
+            ViewGroup g = (ViewGroup) p;
+            try {
+                g.setClipChildren(false);
+                g.setClipToPadding(false);
+            } catch (Throwable ignored) {
+            }
+            p = g.getParent();
+        }
+    }
+
+    /** 屏幕坐标矩形 {left, top, right, bottom}；不可见或零尺寸返回 null */
+    private static int[] rectOf(View v) {
+        if (v == null || v.getVisibility() != View.VISIBLE) return null;
+        int w = v.getWidth(), h = v.getHeight();
+        if (w <= 0 || h <= 0) return null;
+        int[] loc = new int[2];
+        v.getLocationOnScreen(loc);
+        return new int[]{loc[0], loc[1], loc[0] + w, loc[1] + h};
     }
 
     private static TextView findText(View v, String exact) {
