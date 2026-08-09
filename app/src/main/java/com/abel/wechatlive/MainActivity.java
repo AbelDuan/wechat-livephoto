@@ -155,7 +155,7 @@ public class MainActivity extends Activity {
         cbOrig = addCheck(box, Const.K_ORIG, true,
                 "默认开启「原图」(send_raw_img)");
         cbMomentsRaw = addCheck(box, Const.K_MOMENTS_RAW, false,
-                "朋友圈上传原图（默认关；开启后可能与「制作视频」按钮重叠）");
+                "朋友圈上传原图（默认关；开启后自动隐藏微信的「原图」按钮，由本开关统一决定）");
         cbVerbose = addCheck(box, Const.K_VERBOSE, false,
                 "详细日志（导出 View 树，排障用；默认关，省电）");
         cbLog = addCheck(box, Const.K_LOG, false,

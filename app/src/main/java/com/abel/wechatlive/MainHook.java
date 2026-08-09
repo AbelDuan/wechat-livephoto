@@ -188,7 +188,7 @@ public class MainHook implements IXposedHookLoadPackage {
         sProc = lp.processName;
 
         log("========================================");
-        log("WechatLive v8.4 注入成功  proc=" + sProc);
+        log("WechatLive v8.5 注入成功  proc=" + sProc);
 
         // 相册只在主进程，重量级 hook 只装主进程，避免 :push/:appbrand 等无谓开销
         boolean main = Const.WECHAT_PKG.equals(sProc);
@@ -1496,11 +1496,13 @@ public class MainHook implements IXposedHookLoadPackage {
 
         if (!gallery) return;     // 非相册界面：仅心跳，不做 extras 验证
 
-        // 微信相册选择界面（非 SnsUploadUI 发布界面）：修复「原图」与「制作视频」按钮重叠。
-        // v8.4：仅朋友圈流程干预。聊天流程主动复位，保证「原图」按钮是微信默认外观。
+        // 微信相册选择界面（非 SnsUploadUI 发布界面）。
+        // v8.5：朋友圈流程不再尝试挪动「原图」按钮（它与照片/制作视频重叠且挡住点击），
+        //       改为直接隐藏；发不发原图完全由模块强制注入 send_raw_img=true 决定。
+        //       聊天流程保持微信默认外观（并复位可能残留的隐藏/位移）。
         if (!moments) {
             if (cMomentsRaw && fromMomentsFlow()) {
-                fixMomentsButtonOverlap(act);
+                hideMomentsRawButton(act);
             } else {
                 restoreRawButtonLayout(act);
             }
@@ -1677,81 +1679,73 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     /**
-     * 修复微信相册选择界面「原图」与「制作视频」按钮重叠。
+     * v8.5：朋友圈流程 —— 直接隐藏「原图」按钮。
      *
-     * v8.4 重写。之前两版失败的原因（已由 View 树 + 日志证实）：
-     *  1) 位移对象错了——移动的是「原图」那个纯文字 TextView(km9)，而按钮实际是
-     *     km6 容器里的 [圆圈图标 km5 + 文字 km9]。只移文字 → 文字被 km6 边界裁掉不可见，
-     *     图标纹丝不动，于是「重叠没修好」+「原图二字消失」两个症状同时出现。
-     *  2) 方向错了——「原图」所在的 kmg 与「制作视频」所在的 pn 是两条各自贴底的兄弟栏，
-     *     属于上下堆叠，横向左移再多也不可能分开。
-     * 现在：整体移动按钮容器，并优先做纵向上抬。
+     * 为什么不再"挪开"它（v8.1~v8.4 的思路已废弃）：
+     *  - 该按钮是模块强开出来的（key_force_show_raw_image_button），微信自己在朋友圈
+     *    相册里本就不显示它，因此它没有属于自己的布局位置，必然与照片网格 /「制作视频」
+     *    抢占同一块贴底区域；无论横移还是上抬，都只是换个地方继续挡住点击。
+     *  - 用户实测：重叠区域会吃掉触摸事件，导致按钮本身和下面的照片都点不中。
+     *
+     * 现在：把整个按钮容器 setVisibility(GONE)（GONE 而非 INVISIBLE，才会真正让出
+     * 触摸区域与布局空间）。是否发原图不再依赖这个 UI 开关，而是由模块强制注入
+     * send_raw_img=true 决定——即"由 APK 里的「朋友圈上传原图」开关统一控制"。
      */
-    private static void fixMomentsButtonOverlap(final Activity act) {
+    private static void hideMomentsRawButton(final Activity act) {
         final Handler h = ui();
         if (h == null) return;
-        // 「原图」按钮常在勾选图片之后才出现，单次探测会漏 → 多次重试（幂等：每次先复位再算）
-        for (int delay : new int[]{450, 1200, 2500, 4500}) {
-            scheduleOverlapFix(act, h, delay);
+        sLastHideSig = Integer.MIN_VALUE;   // 每次进相册重置，保证本次隐藏有一条日志可查
+        // 「原图」按钮常在勾选图片之后才出现，且微信可能重建/重显 → 多轮重试（幂等）
+        for (int delay : new int[]{300, 900, 1800, 3200, 5000}) {
+            scheduleHideRawButton(act, h, delay);
         }
     }
 
-    /** UI 重叠修复的上次结果签名，用于多次重试时去重日志 */
-    private static int sLastOverlapSig = Integer.MIN_VALUE;
+    /** 上次隐藏结果签名，用于多轮重试时去重日志 */
+    private static int sLastHideSig = Integer.MIN_VALUE;
 
-    private static void scheduleOverlapFix(final Activity act, Handler h, final int delay) {
+    private static void scheduleHideRawButton(final Activity act, Handler h, final int delay) {
         h.postDelayed(new Runnable() {
             @Override
             public void run() {
                 try {
                     View root = act.getWindow().getDecorView();
                     TextView yuanTv = findText(root, "原图");
-                    View makeTv = findTextContains(root, "制作视频");
-                    if (yuanTv == null || makeTv == null) return;   // 没同时出现，无需修复
+                    if (yuanTv == null) return;                     // 还没出现（或已被隐藏）
 
                     View yuan = buttonContainerOf(yuanTv);          // 图标+文字的整体容器
-                    View make = buttonContainerOf(makeTv);
 
-                    // 幂等：每轮重试先完全复位，再基于原始布局重新计算
+                    // 安全阀：容器若混进了「完成/预览/发送/制作视频」等关键按钮，说明识别过宽，
+                    // 直接 GONE 会让用户发不出去 → 退化为只隐藏「原图」文字与它同级的圆圈图标。
+                    boolean tooWide = containsAnyText(yuan, KEY_BTN_TEXTS);
+                    if (tooWide) yuan = yuanTv;
+
+                    // 清掉历史版本可能残留的位移，避免隐藏后再显示时布局是歪的
                     yuanTv.setTranslationX(0); yuanTv.setTranslationY(0);
-                    makeTv.setTranslationX(0); makeTv.setTranslationY(0);
                     yuan.setTranslationX(0);   yuan.setTranslationY(0);
-                    make.setTranslationX(0);   make.setTranslationY(0);
 
-                    int[] a = rectOf(yuan), b = rectOf(make);
-                    if (a == null || b == null) return;
-                    boolean hit = a[0] < b[2] && b[0] < a[2] && a[1] < b[3] && b[1] < a[3];
-                    if (!hit) {                                     // 不重叠：保持微信默认
-                        if (sLastOverlapSig != 0) {
-                            sLastOverlapSig = 0;
-                            log("★ [UI] 原图/制作视频未重叠，保持默认布局");
-                        }
-                        return;
-                    }
+                    boolean changed = yuan.getVisibility() != View.GONE;
+                    yuan.setVisibility(View.GONE);
+                    yuanTv.setVisibility(View.GONE);
+                    if (tooWide) setSiblingIconsVisibility(yuanTv, View.GONE);  // 圆圈也要藏
 
-                    int gap = dpAct(act, 6);
-                    // 两条栏是上下堆叠 → 纵向把「原图」整体抬到「制作视频」之上，这才是真正的解
-                    int up = a[3] - b[1] + gap;
-                    relaxClip(yuan, 4);                             // 防止上抬后被祖先裁掉
-                    yuan.setTranslationY(-up);
-
-                    int sig = up;
-                    if (sig != sLastOverlapSig) {
-                        sLastOverlapSig = sig;
-                        log("★ [UI] 修复重叠：原图整体上抬 " + up + "px"
-                                + "（原图 " + a[0] + "," + a[1] + "-" + a[2] + "," + a[3]
-                                + "  制作视频 " + b[0] + "," + b[1] + "-" + b[2] + "," + b[3] + "）");
+                    if (changed && sLastHideSig != 1) {
+                        sLastHideSig = 1;
+                        log("★ [UI] 朋友圈流程：已隐藏「原图」按钮"
+                                + (tooWide ? "（安全模式：仅文字+图标）" : "")
+                                + "；是否发原图由模块强制 send_raw_img=true 决定");
                     }
                 } catch (Throwable t) {
-                    log("UI 重叠修复失败: " + t);
+                    log("UI 隐藏原图按钮失败: " + t);
                 }
             }
         }, delay);
     }
 
     /**
-     * 聊天等非朋友圈流程：把可能残留的位移全部清零，让「原图」按钮回到微信默认外观。
-     * 必要性：相册 Activity 与 View 会被复用，旧版本残留的 translation 会让文字继续隐身。
+     * 聊天等非朋友圈流程：把可能残留的位移 / 隐藏全部复位，让「原图」按钮回到微信默认外观。
+     * 必要性：相册 Activity 与 View 会被复用——旧版残留的 translation 会让文字继续隐身，
+     * v8.5 朋友圈流程的 GONE 也可能被带到聊天流程里，必须显式还原成 VISIBLE。
      */
     private static void restoreRawButtonLayout(final Activity act) {
         final Handler h = ui();
@@ -1766,16 +1760,21 @@ public class MainHook implements IXposedHookLoadPackage {
                         if (yuanTv == null) return;
                         View yuan = buttonContainerOf(yuanTv);
                         boolean dirty = yuanTv.getTranslationX() != 0 || yuanTv.getTranslationY() != 0
-                                || yuan.getTranslationX() != 0 || yuan.getTranslationY() != 0;
+                                || yuan.getTranslationX() != 0 || yuan.getTranslationY() != 0
+                                || yuan.getVisibility() != View.VISIBLE
+                                || yuanTv.getVisibility() != View.VISIBLE;
                         yuanTv.setTranslationX(0); yuanTv.setTranslationY(0);
                         yuan.setTranslationX(0);   yuan.setTranslationY(0);
+                        yuan.setVisibility(View.VISIBLE);
+                        yuanTv.setVisibility(View.VISIBLE);
+                        setSiblingIconsVisibility(yuanTv, View.VISIBLE);   // 圆圈图标一并还原
                         View makeTv = findTextContains(root, "制作视频");
                         if (makeTv != null) {
                             makeTv.setTranslationX(0); makeTv.setTranslationY(0);
                             View make = buttonContainerOf(makeTv);
                             make.setTranslationX(0);   make.setTranslationY(0);
                         }
-                        if (dirty) log("★ [UI] 非朋友圈流程，已复位「原图」按钮为微信默认布局");
+                        if (dirty) log("★ [UI] 非朋友圈流程，已复位「原图」按钮为微信默认外观");
                     } catch (Throwable ignored) {
                     }
                 }
@@ -1811,28 +1810,48 @@ public class MainHook implements IXposedHookLoadPackage {
         return false;
     }
 
-    /** 放开祖先的裁剪，避免上抬后的视图被父容器切掉 */
-    private static void relaxClip(View v, int levels) {
-        android.view.ViewParent p = v.getParent();
-        for (int i = 0; i < levels && p instanceof ViewGroup; i++) {
-            ViewGroup g = (ViewGroup) p;
-            try {
-                g.setClipChildren(false);
-                g.setClipToPadding(false);
-            } catch (Throwable ignored) {
+    // v8.5：relaxClip / rectOf 随「挪开按钮」方案一并移除（改为直接隐藏，无需算重叠矩形）。
+
+    /** 隐藏容器前的安全阀名单：容器里出现这些文字，说明识别过宽，绝不能整块 GONE */
+    private static final String[] KEY_BTN_TEXTS = {"完成", "预览", "发送", "制作视频"};
+
+    /** 子树中是否出现了给定文字之一 */
+    private static boolean containsAnyText(View v, String[] subs) {
+        if (v instanceof TextView) {
+            CharSequence t = ((TextView) v).getText();
+            if (t != null) {
+                String s = t.toString();
+                for (String sub : subs) {
+                    if (s.contains(sub)) return true;
+                }
             }
-            p = g.getParent();
         }
+        if (v instanceof ViewGroup) {
+            ViewGroup g = (ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) {
+                if (containsAnyText(g.getChildAt(i), subs)) return true;
+            }
+        }
+        return false;
     }
 
-    /** 屏幕坐标矩形 {left, top, right, bottom}；不可见或零尺寸返回 null */
-    private static int[] rectOf(View v) {
-        if (v == null || v.getVisibility() != View.VISIBLE) return null;
-        int w = v.getWidth(), h = v.getHeight();
-        if (w <= 0 || h <= 0) return null;
-        int[] loc = new int[2];
-        v.getLocationOnScreen(loc);
-        return new int[]{loc[0], loc[1], loc[0] + w, loc[1] + h};
+    /** 把标签同级的图标（圆圈/勾选框）一并设为指定可见性——安全模式下的补充处理 */
+    private static void setSiblingIconsVisibility(View label, int vis) {
+        try {
+            android.view.ViewParent p = label.getParent();
+            if (!(p instanceof ViewGroup)) return;
+            ViewGroup g = (ViewGroup) p;
+            for (int i = 0; i < g.getChildCount(); i++) {
+                View c = g.getChildAt(i);
+                if (c == label) continue;
+                String n = c.getClass().getSimpleName().toLowerCase(Locale.US);
+                if (c instanceof android.widget.ImageView
+                        || n.contains("image") || n.contains("checkbox")) {
+                    c.setVisibility(vis);
+                }
+            }
+        } catch (Throwable ignored) {
+        }
     }
 
     private static TextView findText(View v, String exact) {
