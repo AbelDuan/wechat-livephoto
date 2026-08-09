@@ -132,9 +132,18 @@ public class MainHook implements IXposedHookLoadPackage {
     private static volatile int sRawInjected = 0;      // 原图字节直塞成功次数
     private static volatile int sQualityBoost = 0;     // quality 拉满次数
     // v8.2 复制法：按尺寸匹配原图覆盖上传临时文件
-    private static volatile int sCopyInjected = 0;     // 复制法成功次数
+    private static volatile int sCopyInjected = 0;     // 复制法「实际写入」次数
     private static volatile int sCopyLogged = 0;       // 复制法跳过说明限次
     private static volatile int sMainProbe = 0;        // 主图 compress 到达诊断限次
+    // v8.3：temp 本来就等于原图字节（微信原图模式已生效，无需覆盖）——与实际写入分开统计，
+    //       v8.2 把这两种情况都算成「注入成功」，导致统计虚高、误判。
+    private static volatile int sRawSame = 0;
+    private static final int COPY_FAIL = 0, COPY_SAME = 1, COPY_WRITTEN = 2;
+    // v8.3 产物核验：微信可能在流关闭「之后」再次重编码上传文件，延迟回查并纠正
+    private static final Set<String> sDraftDirs = new HashSet<String>();
+    private static volatile long sSweepAt = 0L;        // 上次安排核验的时间，去重
+    private static volatile boolean sSweeping = false; // 核验中：防止自身 IO 触发探针递归
+    private static volatile int sSweepLogged = 0;      // 核验日志限次
 
     private static String sProc = "?";
     private static long sLastReport = 0L;
@@ -172,7 +181,7 @@ public class MainHook implements IXposedHookLoadPackage {
         sProc = lp.processName;
 
         log("========================================");
-        log("WechatLive v8.2 注入成功  proc=" + sProc);
+        log("WechatLive v8.3 注入成功  proc=" + sProc);
 
         // 相册只在主进程，重量级 hook 只装主进程，避免 :push/:appbrand 等无谓开销
         boolean main = Const.WECHAT_PKG.equals(sProc);
@@ -814,7 +823,7 @@ public class MainHook implements IXposedHookLoadPackage {
             private final Set<String> seen = new HashSet<String>();
             @Override
             protected void afterHookedMethod(MethodHookParam p) {
-                if (sCopying || !cMomentsRaw || logged >= 60) return;
+                if (sCopying || sSweeping || !cMomentsRaw || logged >= 60) return;
                 try {
                     Object a0 = p.args[0];
                     String path = a0 instanceof File ? ((File) a0).getAbsolutePath()
@@ -830,7 +839,9 @@ public class MainHook implements IXposedHookLoadPackage {
                     seen.add(path);
                     logged++;
                     // v8.1：不再打完整调用栈（一条 30+ 行，1418 行日志里 889 行都是它）
-                    log("★ [写] " + shortPath(path) + " size=" + safeSize(path));
+                    // 这里是「流刚打开」的时刻，新建文件必然 0 字节，打 size=0 纯属误导
+                    long sz = safeSize(path);
+                    log("★ [写] " + shortPath(path) + (sz > 0 ? " 追加于 " + sz + "B" : " (新建)"));
                 } catch (Throwable ignored) {
                 }
             }
@@ -849,7 +860,7 @@ public class MainHook implements IXposedHookLoadPackage {
             private final Set<String> seen = new HashSet<String>();
             @Override
             protected void afterHookedMethod(MethodHookParam p) {
-                if (!cMomentsRaw || logged >= 20) return;
+                if (sSweeping || !cMomentsRaw || logged >= 20) return;
                 try {
                     Object a0 = p.args[0];
                     String path = a0 instanceof File ? ((File) a0).getAbsolutePath()
@@ -916,7 +927,7 @@ public class MainHook implements IXposedHookLoadPackage {
         XC_MethodHook srcHook = new XC_MethodHook() {
             @Override
             protected void afterHookedMethod(MethodHookParam p) {
-                if (sCopying || sInjecting || !cMomentsRaw) return;
+                if (sCopying || sInjecting || sSweeping || !cMomentsRaw) return;
                 try {
                     Object a0 = p.args[0];
                     String path = a0 instanceof File ? ((File) a0).getAbsolutePath()
@@ -952,7 +963,7 @@ public class MainHook implements IXposedHookLoadPackage {
             XposedHelpers.findAndHookMethod(FileOutputStream.class, "close", new XC_MethodHook() {
                 @Override
             protected void afterHookedMethod(MethodHookParam p) {
-                if (sCopying || !cMomentsRaw) return;
+                if (sCopying || sSweeping || !cMomentsRaw) return;
                 try {
                     String temp = sFosTemp.remove(p.thisObject);
                     if (temp == null) return;
@@ -966,10 +977,21 @@ public class MainHook implements IXposedHookLoadPackage {
                     }
                     String orig = findOriginalForDims(twh[0], twh[1]);
                     if (orig != null) {
-                        overwriteTempWithOriginal(temp, orig);
-                        sCopyInjected++;
-                        log("★ [复制法注入] temp=" + shortPath(temp) + " " + twh[0] + "x" + twh[1]
-                                + " ← " + shortPath(orig) + " 第" + sCopyInjected + "次");
+                        int r = overwriteTempWithOriginal(temp, orig);
+                        if (r == COPY_WRITTEN) {
+                            sCopyInjected++;
+                            log("★ [复制法注入] temp=" + shortPath(temp) + " " + twh[0] + "x" + twh[1]
+                                    + " ← " + shortPath(orig) + " 已覆盖 " + safeSize(temp)
+                                    + "B 第" + sCopyInjected + "次");
+                        } else if (r == COPY_SAME) {
+                            sRawSame++;
+                            log("★ [原图确认] temp=" + shortPath(temp) + " " + twh[0] + "x" + twh[1]
+                                    + " 与原图 " + shortPath(orig) + " 字节完全一致 " + safeSize(temp)
+                                    + "B（微信原图模式已生效）第" + sRawSame + "次");
+                        }
+                        // 微信有可能在流关闭之后再重编码一次，安排一次延迟核验兜底
+                        rememberDraftDir(temp);
+                        scheduleSweep();
                     } else if (sCopyLogged < 6) {
                         sCopyLogged++;
                         log("★ [复制法跳过] 无尺寸匹配原图 temp=" + shortPath(temp)
@@ -1251,20 +1273,24 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     /** 把原图覆盖进朋友圈上传临时文件（复制法核心动作）。一次成功即停，避免反复写。 */
-    private static void overwriteTempWithOriginal(String temp, String original) {
-        if (sCopying) return;          // 防止覆盖动作自身的流递归触发
+    /**
+     * 用原图字节覆盖上传临时文件。
+     * @return COPY_WRITTEN=实际写入 / COPY_SAME=本已是原图字节(无需写) / COPY_FAIL=跳过或失败
+     * 注意：本方法只在失败时打日志，成功/幂等的措辞交给调用方——v8.2 两边都打导致
+     *      「跳过」和「注入成功」同时出现，日志自相矛盾。
+     */
+    private static int overwriteTempWithOriginal(String temp, String original) {
+        if (sCopying) return COPY_FAIL;   // 防止覆盖动作自身的流递归触发
         sCopying = true;
         try {
             File src = new File(original);
             File dst = new File(temp);
             if (!src.exists() || src.length() < 1024) {
                 log("复制法跳过: 原图不存在或过小 original=" + original);
-                return;
+                return COPY_FAIL;
             }
-            long cur = dst.length();
-            if (cur == src.length() && dst.exists()) {
-                log("复制法跳过: 临时文件已为原图大小 temp=" + temp);
-                return;
+            if (dst.exists() && dst.length() == src.length()) {
+                return COPY_SAME;         // 字节数一致 = 微信自己就复制了原图，别白写一遍
             }
             FileInputStream in = new FileInputStream(src);
             java.io.FileOutputStream out = new java.io.FileOutputStream(dst, false);
@@ -1273,12 +1299,89 @@ public class MainHook implements IXposedHookLoadPackage {
             while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
             in.close();
             out.close();
-            log("★ [复制法] 已用原图覆盖上传临时文件 temp=" + temp
-                    + " 原图=" + original + " size=" + dst.length());
+            return COPY_WRITTEN;
         } catch (Throwable t) {
             log("复制法覆盖失败: temp=" + temp + " err=" + t);
+            return COPY_FAIL;
         } finally {
             sCopying = false;
+        }
+    }
+
+    /** 记住上传临时文件所在的 draft 目录，供发表后延迟核验 */
+    private static void rememberDraftDir(String temp) {
+        try {
+            File p = new File(temp).getParentFile();
+            if (p == null) return;
+            synchronized (sDraftDirs) {
+                if (sDraftDirs.size() < 32) sDraftDirs.add(p.getAbsolutePath());
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * 安排一次延迟核验。
+     * 关键：流 close 时 temp 可能已是原图，但微信随后还会在上传链里解码→（我们取消缩放）→重编码，
+     * 有可能把原图字节又盖回去。等几秒回查，才知道「最终躺在磁盘上的」到底是不是原图。
+     */
+    private static void scheduleSweep() {
+        long now = System.currentTimeMillis();
+        if (now - sSweepAt < 4000L) return;      // 4s 内已安排过，多图共用一次
+        sSweepAt = now;
+        try {
+            Thread t = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    try { Thread.sleep(7000L); } catch (Throwable ignored) { }
+                    sweepDraftDirs();
+                }
+            }, "wl-sweep");
+            t.setDaemon(true);
+            t.start();
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** 回查 draft 目录里的上传主文件：与原图字节一致则确认，被重编码则回写原图 */
+    private static void sweepDraftDirs() {
+        if (sSweeping) return;
+        sSweeping = true;
+        try {
+            List<String> dirs;
+            synchronized (sDraftDirs) { dirs = new ArrayList<String>(sDraftDirs); }
+            for (String d : dirs) {
+                File[] fs = new File(d).listFiles();
+                if (fs == null) continue;
+                for (File f : fs) {
+                    try {
+                        String path = f.getAbsolutePath();
+                        if (!isImageTemp(path)) continue;    // 只核验基础上传文件
+                        long len = f.length();
+                        if (len < 1024) continue;
+                        int[] wh = boundsOf(path);
+                        if (wh == null) continue;
+                        String orig = findOriginalForDims(wh[0], wh[1]);
+                        if (orig == null) continue;
+                        long ol = new File(orig).length();
+                        if (sSweepLogged >= 10) continue;
+                        sSweepLogged++;
+                        if (len == ol) {
+                            log("★ [产物核验] " + shortPath(path) + " " + wh[0] + "x" + wh[1]
+                                    + " = 原图字节 " + len + "B ✓ 原图+EXIF 已保住");
+                        } else {
+                            int r = overwriteTempWithOriginal(path, orig);
+                            log("★ [产物核验] " + shortPath(path) + " " + wh[0] + "x" + wh[1]
+                                    + " 被重编码 " + len + "B ≠ 原图 " + ol + "B → "
+                                    + (r == COPY_WRITTEN ? "已回写原图 ✓" : "回写失败 ✗"));
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        } finally {
+            sSweeping = false;
         }
     }
 
@@ -1384,7 +1487,8 @@ public class MainHook implements IXposedHookLoadPackage {
             }
             if (sLastOriginalPath != null) ps.append("\n    [FileInputStream] ").append(sLastOriginalPath);
             ps.append("\n  ★ 注入统计：原图直塞=" + sRawInjected
-                    + "  质量拉满=" + sQualityBoost + "  复制法=" + sCopyInjected);
+                    + "  质量拉满=" + sQualityBoost + "  复制法覆盖=" + sCopyInjected
+                    + "  原图确认=" + sRawSame);
             log(ps.toString());
         }
 
