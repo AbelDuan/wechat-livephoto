@@ -153,7 +153,7 @@ public class MainActivity extends Activity {
         cbLive = addCheck(box, Const.K_LIVE, true,
                 "默认开启「实况」(Gallery_LivePhoto_Auto_Enable)");
         cbOrig = addCheck(box, Const.K_ORIG, true,
-                "默认开启「原图」(send_raw_img)");
+                "聊天发图默认开启「原图」(可在微信里手动取消，取消后本次不再强制)");
         cbMomentsRaw = addCheck(box, Const.K_MOMENTS_RAW, false,
                 "朋友圈上传原图（默认关；开启后自动隐藏微信的「原图」按钮，由本开关统一决定）");
         cbVerbose = addCheck(box, Const.K_VERBOSE, false,

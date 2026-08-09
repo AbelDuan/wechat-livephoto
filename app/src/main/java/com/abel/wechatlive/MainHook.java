@@ -151,6 +151,13 @@ public class MainHook implements IXposedHookLoadPackage {
     // v8.4：进入相册前的来源界面。用于区分「朋友圈选图」与「聊天选图」——
     //      两者共用 AlbumPreviewUI，仅靠当前 Activity 类名无法分辨。
     private static volatile String sLastNonGallery = "";
+    // v8.6：用户在本次聊天选图流程中手动取消了「原图」。置位后本流程内不再强制该键，
+    //      否则读取侧兜底会把用户的取消立刻改回勾选（v8.5 的 bug）。
+    private static volatile boolean sChatRawOptOut = false;
+    // v8.6：本次相册选图流程的进入时刻，用来区分「界面初始化写入」与「用户手动取消」
+    private static volatile long sGalleryEnterAt = 0L;
+    // 进入相册后这段时间内出现的 send_raw_img=false 视为初始化写入，不算用户取消
+    private static final long RAW_OPTOUT_GRACE_MS = 1200L;
 
     private static String sProc = "?";
     private static long sLastReport = 0L;
@@ -188,7 +195,7 @@ public class MainHook implements IXposedHookLoadPackage {
         sProc = lp.processName;
 
         log("========================================");
-        log("WechatLive v8.5 注入成功  proc=" + sProc);
+        log("WechatLive v8.6 注入成功  proc=" + sProc);
 
         // 相册只在主进程，重量级 hook 只装主进程，避免 :push/:appbrand 等无谓开销
         boolean main = Const.WECHAT_PKG.equals(sProc);
@@ -218,22 +225,54 @@ public class MainHook implements IXposedHookLoadPackage {
             if (K_LIVE_AUTO.equals(key)) return Boolean.TRUE;
             if (K_LIVE_QUERY.equals(key)) return Boolean.TRUE;
         }
-        if (cOrig) {
-            // 原图按钮/原图开关：相册/聊天发送流程强开；
-            // 朋友圈发布界面默认排除（避免与「制作视频」重叠的幽灵按钮）。
-            if (!isMomentsPublisher(sCurrentActivity)) {
-                if (K_SEND_RAW.equals(key)) return Boolean.TRUE;
-                if (K_SHOW_RAW_BTN.equals(key)) return Boolean.TRUE;
+        boolean moments = isMomentsPublisher(sCurrentActivity);
+        if (cOrig && !moments) {
+            // 「原图」按钮本身始终允许显示 —— 聊天流程要让用户能自己点。
+            if (K_SHOW_RAW_BTN.equals(key)) return Boolean.TRUE;
+            if (K_SEND_RAW.equals(key)) {
+                // v8.6 关键修复：用户手动取消过就完全不干预。
+                // 旧版无条件 return TRUE，且读取侧(getBooleanExtra/Bundle.getBoolean)
+                // 还会再兜一次 → 用户取消后一打开图片，微信重新读键又拿到 true，
+                // 「原图」被自动勾回去。
+                if (sChatRawOptOut) return null;
+                return Boolean.TRUE;   // 未取消：维持「默认开启原图」
             }
         }
-        if (cMomentsRaw && (isMomentsPublisher(sCurrentActivity) || looksLikeGallery(sCurrentActivity))) {
-            // 朋友圈上传原图：单独开关控制。开启后在「相册选择界面」(构建启动 SnsUploadUI 的
-            // Intent 时)与 SnsUploadUI 自身都强制原图键，确保键真实存在(containsKey 通过)，
-            // 而非仅在读取侧覆盖值——实测 SnsUploadUI 的 Intent 不含该键会导致强制失效。
+        // 朋友圈上传原图：单独开关控制。开启后在「相册选择界面」(构建启动 SnsUploadUI 的
+        // Intent 时)与 SnsUploadUI 自身都强制原图键，确保键真实存在(containsKey 通过)，
+        // 而非仅在读取侧覆盖值——实测 SnsUploadUI 的 Intent 不含该键会导致强制失效。
+        // v8.6：加 fromMomentsFlow() 限定。旧版只写 looksLikeGallery()，而它匹配
+        //       gallery/album/imagepreview → 聊天相册与图片预览界面全被命中，
+        //       于是聊天流程被这条二次强制，是"取消原图无效"的另一半根因。
+        if (cMomentsRaw && (moments || (looksLikeGallery(sCurrentActivity) && fromMomentsFlow()))) {
             if (K_SEND_RAW.equals(key)) return Boolean.TRUE;
             if (K_SHOW_RAW_BTN.equals(key)) return Boolean.TRUE;
         }
         return null;
+    }
+
+    /**
+     * v8.6：识别「用户在聊天流程里手动取消了原图」。
+     *
+     * 微信在用户点掉「原图」勾选框后，会在跳转下个界面（如 ImagePreviewUI）时
+     * putExtra(send_raw_img,false)。旧版把它无脑改写成 true，用户的取消动作等于没发生。
+     * 这里只认「进入相册 GRACE 毫秒之后」出现的 false 写入 —— 界面初始化阶段的写入
+     * 都发生在最初几百毫秒内，用户不可能这么快点完取消，以此避开误判。
+     *
+     * @return true 表示这是用户的取消动作，调用方应原样放行、不要改写
+     */
+    private static boolean noteChatRawOptOut(String key, Object val) {
+        if (!K_SEND_RAW.equals(key)) return false;
+        if (!Boolean.FALSE.equals(val)) return false;
+        if (sChatRawOptOut) return true;                 // 已取消过：后续一律放行
+        // 朋友圈流程按钮是隐藏的，用户点不到，不参与取消判定
+        if (isMomentsPublisher(sCurrentActivity) || fromMomentsFlow()) return false;
+        if (!looksLikeGallery(sCurrentActivity)) return false;
+        long t0 = sGalleryEnterAt;
+        if (t0 <= 0L || System.currentTimeMillis() - t0 < RAW_OPTOUT_GRACE_MS) return false;
+        sChatRawOptOut = true;
+        log("★ [原图] 检测到用户手动取消「原图」→ 本次选图流程内不再强制（尊重用户选择）");
+        return true;
     }
 
     private void installExtraForcing() {
@@ -263,6 +302,9 @@ public class MainHook implements IXposedHookLoadPackage {
                             if (!cEnabled) return;
                             try {
                                 String k = (String) p.args[0];
+                                // v8.6：聊天流程里，界面初始化之后出现的 send_raw_img=false
+                                //      就是用户点掉了「原图」。原样放行，不再改写。
+                                if (noteChatRawOptOut(k, p.args[1])) return;
                                 Boolean want = desired(k);
                                 if (want != null && !want.equals(p.args[1])) {
                                     p.args[1] = want;
@@ -1487,7 +1529,16 @@ public class MainHook implements IXposedHookLoadPackage {
         boolean moments = isMomentsPublisher(cls);
         // v8.4：相册界面(AlbumPreviewUI)聊天与朋友圈共用，类名分不出来。
         //      记住进入相册「之前」停留的界面，用它判断本次选图属于哪条流程。
-        if (!gallery) sLastNonGallery = cls;
+        if (!gallery) {
+            sLastNonGallery = cls;
+            // v8.6：离开相册 = 本次选图流程结束。重置「用户取消原图」状态，
+            //      下次进相册重新按「默认开启原图」处理。
+            sChatRawOptOut = false;
+            sGalleryEnterAt = 0L;
+        } else if (sGalleryEnterAt == 0L) {
+            // v8.6：本次选图流程开始计时（ImagePreviewUI 也算 gallery，同一流程内不重置）
+            sGalleryEnterAt = System.currentTimeMillis();
+        }
         // 更极致：非相册界面不心跳；仅首次 onResume 上报一次以证明注入成功
         if (!gallery && sReportedOnce) return;
         // 心跳 + 拉取开关（后台线程，不阻塞微信主线程）
