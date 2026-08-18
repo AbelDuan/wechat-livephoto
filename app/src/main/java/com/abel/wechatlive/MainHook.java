@@ -2142,8 +2142,10 @@ public class MainHook extends XposedModule {
     /**
      * 反射找方法。先找公共方法（含继承），找不到再找声明方法并放开访问。
      * 注意：Bundle.putBoolean/getBoolean 定义在 BaseBundle，必须能查继承方法。
+     * 调用方必须处于 try/catch(Throwable) 内（所有 hook 安装点均满足）。
      */
-    private static Method findMethod(Class<?> cls, String name, Class<?>... pts) {
+    private static Method findMethod(Class<?> cls, String name, Class<?>... pts)
+            throws NoSuchMethodException {
         try {
             return cls.getMethod(name, pts);
         } catch (NoSuchMethodException e) {
@@ -2153,8 +2155,9 @@ public class MainHook extends XposedModule {
         }
     }
 
-    /** 反射找构造器（先公共后声明） */
-    private static Constructor<?> findCtor(Class<?> cls, Class<?>... pts) {
+    /** 反射找构造器（先公共后声明）。调用方必须处于 try/catch(Throwable) 内。 */
+    private static Constructor<?> findCtor(Class<?> cls, Class<?>... pts)
+            throws NoSuchMethodException {
         try {
             return cls.getConstructor(pts);
         } catch (NoSuchMethodException e) {
