@@ -58,7 +58,7 @@ public class MainActivity extends Activity {
     private TextView statusView;
     private TextView detailView;
     private TextView logView;
-    private CheckBox cbEnabled, cbLive, cbOrig, cbVerbose, cbLog, cbMomentsRaw;
+    private CheckBox cbEnabled, cbLive, cbOrig, cbLog, cbMomentsRaw;
     private Button iconBtn;
 
     private final Handler ticker = new Handler(Looper.getMainLooper());
@@ -149,17 +149,15 @@ public class MainActivity extends Activity {
         box.setPadding(dp(10), dp(6), dp(10), dp(6));
 
         cbEnabled = addCheck(box, Const.K_ENABLED, true,
-                "启用模块（总开关，关闭=暂停一切操作）");
+                "启用模块");
         cbLive = addCheck(box, Const.K_LIVE, true,
-                "默认开启「实况」(Gallery_LivePhoto_Auto_Enable)");
+                "默认开启「实况」");
         cbOrig = addCheck(box, Const.K_ORIG, true,
-                "聊天发图默认开启「原图」(可在微信里手动取消，取消后本次不再强制)");
+                "聊天发图默认开启「原图」");
         cbMomentsRaw = addCheck(box, Const.K_MOMENTS_RAW, false,
-                "朋友圈上传原图（默认关；开启后自动隐藏微信的「原图」按钮，由本开关统一决定）");
-        cbVerbose = addCheck(box, Const.K_VERBOSE, false,
-                "详细日志（导出 View 树，排障用；默认关，省电）");
+                "朋友圈上传「原图」");
         cbLog = addCheck(box, Const.K_LOG, false,
-                "日志记录（排障/导出用，默认关闭，省电）");
+                "日志记录");
 
         topInner.addView(box, mw());
 

@@ -186,7 +186,8 @@ public class MainHook extends XposedModule {
     private static volatile boolean cEnabled = true;
     private static volatile boolean cLive = true;
     private static volatile boolean cOrig = true;
-    // 详细日志(导出 View 树)默认关闭——这是最大的功耗点，排障时再打开
+    // 详细日志(导出 View 树)默认关闭——v8.9 起「详细日志」开关已从设置页移除，
+    // 恒为 false（功能下线；下方 cVerbose 分支全部不再触发，保留为死代码避免大改）
     private static volatile boolean cVerbose = false;
     // 日志记录(写入 App 文件，供导出/排查)默认关闭——省电，心跳自检不受影响
     private static volatile boolean cLog = false;
@@ -212,7 +213,7 @@ public class MainHook extends XposedModule {
             sSelf = this;
             sProc = myProcName();
             log("========================================");
-            log("WechatLive v8.7 注入成功  proc=" + sProc);
+            log("WechatLive v8.9 注入成功  proc=" + sProc);
 
             // 相册只在主进程，重量级 hook 只装主进程，避免 :push/:appbrand 等无谓开销
             boolean main = Const.WECHAT_PKG.equals(sProc);
@@ -1669,7 +1670,6 @@ public class MainHook extends XposedModule {
         if (moments) {
             log("★ 朋友圈发布界面：已抓取该界面全部 Intent extras（见上方）。");
             log("  诊断已落盘——请在本界面停留约 1 秒，再回 App「导出日志」即可拿到完整抓取。");
-            log("  如需 View 树，请开启「详细日志」后重新进入本界面。");
             StringBuilder ps = new StringBuilder("★ 本次会话已捕获原图路径(Intent=" + sSelectedPaths.size()
                     + "  FileInputStream探针=" + (sLastOriginalPath != null ? 1 : 0) + "):");
             synchronized (sSelectedPaths) {
@@ -2113,7 +2113,7 @@ public class MainHook extends XposedModule {
                         cEnabled = out.getBoolean(Const.K_ENABLED, true);
                         cLive = out.getBoolean(Const.K_LIVE, true);
                         cOrig = out.getBoolean(Const.K_ORIG, true);
-                        cVerbose = out.getBoolean(Const.K_VERBOSE, false);
+                        // v8.9：详细日志开关已移除，cVerbose 恒为 false，不再从 App 读取
                         cLog = out.getBoolean(Const.K_LOG, false);
                         cMomentsRaw = out.getBoolean(Const.K_MOMENTS_RAW, false);
                     }
