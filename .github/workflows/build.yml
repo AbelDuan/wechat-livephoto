@@ -69,6 +69,26 @@ jobs:
           sys.exit(1 if bad else 0)
           PY
 
+      # v8.7（LibXposed 迁移）：API 102 硬约束——模块内禁止调用 legacy
+      # de.robv.android.xposed.* API，否则加载即失败。
+      - name: Guard - MainHook must not use legacy XposedBridge API
+        run: |
+          python3 - <<'PY'
+          import re, sys, pathlib
+          src = pathlib.Path('app/src/main/java/com/abel/wechatlive/MainHook.java').read_text(encoding='utf-8')
+          code = re.sub(r'/\*.*?\*/', '', src, flags=re.S)
+          code = re.sub(r'//[^\n]*', '', code)
+          PAT = re.compile(r'de\.robv\.android\.xposed|XposedBridge|XposedHelpers|IXposedHookLoadPackage|XC_MethodHook|XC_LoadPackage')
+          bad = False
+          for i, line in enumerate(code.splitlines(), 1):
+              if PAT.search(line):
+                  print('::error::MainHook.java:%d 引用了 legacy Xposed API，API 102 禁止 -> %s'
+                        % (i, line.strip()))
+                  bad = True
+          print('OK: MainHook 纯 LibXposed API' if not bad else 'GUARD FAILED')
+          sys.exit(1 if bad else 0)
+          PY
+
       - name: Build debug APK (auto-signed with debug key)
         uses: gradle/gradle-build-action@v3
         with:
@@ -76,23 +96,30 @@ jobs:
           build-root-directory: .
           arguments: :app:assembleDebug
 
-      # LSPosed 部分实现加载模块只扫主 dex，入口类必须在 classes.dex 里。
+      # LSPosed/LibXposed 部分实现加载模块只扫主 dex，入口类必须在 classes.dex 里。
       # 出现 classes2.dex 就直接让构建失败，避免又产出一个"装了没反应"的包。
+      # v8.7：模块声明从 assets/xposed_init + manifest meta-data 改为 META-INF/xposed/。
       - name: Verify single-dex & entry class
         run: |
           APK=$(ls app/build/outputs/apk/debug/*.apk | head -1)
           echo "APK = $APK"
-          unzip -l "$APK" | grep -E 'classes[0-9]*\.dex|assets/xposed'
+          unzip -l "$APK" | grep -E 'classes[0-9]*\.dex|META-INF/xposed/'
           if unzip -l "$APK" | grep -q 'classes2.dex'; then
             echo "::error::APK 被拆成多个 dex，入口类可能不在主 dex，LSPosed 会加载失败"
             exit 1
           fi
+          for f in module.prop java_init.list scope.list; do
+            if ! unzip -l "$APK" | grep -q "META-INF/xposed/$f"; then
+              echo "::error::APK 缺少 META-INF/xposed/$f，LibXposed 无法识别模块"
+              exit 1
+            fi
+          done
           unzip -p "$APK" classes.dex > /tmp/c.dex
           if ! grep -q 'com/abel/wechatlive/MainHook' /tmp/c.dex; then
             echo "::error::主 dex 中找不到 MainHook 入口类"
             exit 1
           fi
-          echo "OK: 单 dex，且 MainHook 在主 dex 中"
+          echo "OK: 单 dex，MainHook 在主 dex，META-INF/xposed 三件套齐全"
           echo "--- 签名指纹（应每次构建都一致，保证可覆盖安装）---"
           unzip -p "$APK" META-INF/*.RSA 2>/dev/null | keytool -printcert 2>/dev/null | grep -E 'SHA1|SHA256' || true
 

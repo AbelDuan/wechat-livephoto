@@ -1,0 +1,2 @@
+# LibXposed Java 入口类（每行一个全限定名）
+com.abel.wechatlive.MainHook

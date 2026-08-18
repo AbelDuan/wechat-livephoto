@@ -4,10 +4,11 @@ android {
     compileSdkVersion 33
     defaultConfig {
         applicationId "com.abel.wechatlive"
-        minSdkVersion 24
+        // LibXposed API 100+ 要求 Android 8.1+（原为 24/Android 7.0）
+        minSdkVersion 27
         targetSdkVersion 28
-        versionCode 24
-        versionName "8.6"
+        versionCode 25
+        versionName "8.7"
         // 必须单 dex：见 gradle.properties 说明
         multiDexEnabled false
     }
@@ -42,6 +43,9 @@ android {
 }
 
 dependencies {
-    // LSPosed / Xposed 标准 API（compileOnly，不打包进 apk）
-    compileOnly 'de.robv.android.xposed:api:82'
+    // LibXposed 现代 API（compileOnly，不打包进 apk）。API 102 要求：
+    //   1) 模块入口 extends XposedModule（不再 implements 旧版 IXposedHookLoadPackage）
+    //   2) 模块内禁止调用旧版 Xposed API（de.robv.*）
+    //   3) minSdk >= 27（Android 8.1+）
+    compileOnly 'io.github.libxposed:api:102'
 }

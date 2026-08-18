@@ -1,0 +1,6 @@
+# LibXposed 模块配置（v8.7 起）
+# 必需：minApiVersion（要求的最低框架 API）、targetApiVersion（目标 API）。
+# API 102 行为变化：targetApiVersion>=102 时模块内禁止调用 legacy de.robv.android.xposed.* API。
+# 模块名称取 android:label（WechatLive），描述取 android:description。
+minApiVersion=100
+targetApiVersion=102

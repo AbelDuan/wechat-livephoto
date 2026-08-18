@@ -12,7 +12,5 @@ allprojects {
     repositories {
         google()
         mavenCentral()
-        // Xposed / LSPosed API 仓库（编译期 de.robv.android.xposed.* 依赖来源）
-        maven { url 'https://api.xposed.info/' }
     }
 }

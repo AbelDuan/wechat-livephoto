@@ -19,6 +19,8 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.RandomAccessFile;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Method;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
@@ -32,17 +34,29 @@ import java.util.WeakHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
 
-import de.robv.android.xposed.IXposedHookLoadPackage;
-import de.robv.android.xposed.XC_MethodHook;
-import de.robv.android.xposed.XposedBridge;
-import de.robv.android.xposed.XposedHelpers;
-import de.robv.android.xposed.callbacks.XC_LoadPackage;
+import io.github.libxposed.api.XposedInterface;
+import io.github.libxposed.api.XposedModule;
+import io.github.libxposed.api.XposedModuleInterface.PackageReadyParam;
 
 /**
- * WechatLive v5 —— 微信「实况(LivePhoto) + 原图」默认开启
+ * WechatLive v8.7 —— 微信「实况(LivePhoto) + 原图」默认开启（LibXposed 迁移版）
  *
  * ══════════════════════════════════════════════════════════════════
- * 【核心方案变更：从"点击 UI"改为"改写 Intent extras"】
+ * 【v8.7 框架迁移：XposedBridge API 82 → LibXposed API 102】
+ *
+ * 旧 API（de.robv.android.xposed）已废弃，LSPosed 2.x 主推 LibXposed：
+ *   - 入口：implements IXposedHookLoadPackage → extends XposedModule
+ *   - 回调：XC_MethodHook(before/after) → 拦截器链 Hooker.intercept(Chain)
+ *   - 改参数：p.args[i]=x → 组装新参数后 chain.proceed(newArgs)
+ *   - 改返回值：p.setResult(x) → return x；p.getResult() → chain.proceed() 的返回值
+ *   - 短路：p.setResult(x); return → return x（不调用 proceed）
+ *   - 日志：XposedBridge.log → 实例 log(priority, tag, msg)（经 sSelf 桥接）
+ *   - 模块声明：assets/xposed_init + manifest meta-data → META-INF/xposed/
+ *     （module.prop / java_init.list / scope.list）
+ *   - API 102 约束：模块内禁止调用 legacy de.robv.android.xposed.*
+ *
+ * ══════════════════════════════════════════════════════════════════
+ * 【核心方案：改写 Intent extras】
  *
  * 从 LSPosed 日志里实锤到：微信启动相册界面时，Intent extras 里明文携带
  *   AlbumPreviewUI:  Gallery_LivePhoto_Need_Query=true
@@ -57,22 +71,14 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  *   - 不依赖微信混淆类名，微信升级后大概率仍然有效
  *
  * ══════════════════════════════════════════════════════════════════
- * 【v4 为什么完全没跑起来 —— 已修复】
+ * 【入口类静态初始化铁律】
  *
- * v4 有一行静态字段初始化：
- *     private static final Handler H = new Handler(Looper.getMainLooper());
- *
- * LSPosed 是在 **zygote** 里 Class.newInstance() 实例化模块类的
- * （forkCommon → loadModule → initModule）。那个时刻主线程 Looper 尚未准备好，
- * Looper.getMainLooper() 返回 null → Handler 构造函数 NPE
- * → ExceptionInInitializerError → 整个模块在**所有进程**加载失败。
- *
- * 症状就是：装了、勾了、作用域也对，但完全没反应、一条日志都没有。
- *
- * ✅ 铁律：模块入口类的静态初始化块里**绝不能碰任何 Android 框架对象**
- *    （Handler / Looper / Context / Resources ...）。一律改为懒加载。
+ * LibXposed（API 101+）在目标进程内实例化模块入口类。入口类的静态字段与
+ * 静态初始化块里**绝不能碰任何 Android 框架对象**（Handler / Looper /
+ * Context / Resources ...），一律懒加载（v4 曾因 Handler(Looper.getMainLooper())
+ * 在 zygote 阶段 NPE 导致整个模块在所有进程加载失败）。
  */
-public class MainHook implements IXposedHookLoadPackage {
+public class MainHook extends XposedModule {
 
     private static final String TAG = "WCLP";
 
@@ -86,7 +92,10 @@ public class MainHook implements IXposedHookLoadPackage {
     /** 强制显示原图按钮 */
     private static final String K_SHOW_RAW_BTN = "key_force_show_raw_image_button";
 
-    // ── 纯 Java 静态字段，zygote 阶段安全 ──
+    // ── 纯 Java 静态字段，入口阶段安全 ──
+    // v8.7：LibXposed 入口实例引用。static log() 通过它把日志写进框架日志
+    // （LSPosed 管理器「日志」页可看）。非微信进程/入口未初始化时为 null，跳过。
+    private static volatile MainHook sSelf;
     private static final List<String> PENDING = new ArrayList<String>();
     // 会话内捕获的「原图」路径（相册选中时记下），供诊断与 v7.7 复制法定位压缩源
     private static final List<String> sSelectedPaths = new ArrayList<String>();
@@ -148,6 +157,7 @@ public class MainHook implements IXposedHookLoadPackage {
     //      绝不能再用 findOriginalForDims 按尺寸重查——多图同尺寸时会全部命中同一张，
     //      把已正确的文件覆盖成别人的照片（v8.3 实测九宫格出现重复图）。
     private static final Map<String, String> sTempOrig = new HashMap<String, String>();
+
     // v8.4：进入相册前的来源界面。用于区分「朋友圈选图」与「聊天选图」——
     //      两者共用 AlbumPreviewUI，仅靠当前 Activity 类名无法分辨。
     private static volatile String sLastNonGallery = "";
@@ -180,37 +190,58 @@ public class MainHook implements IXposedHookLoadPackage {
     private static volatile boolean cVerbose = false;
     // 日志记录(写入 App 文件，供导出/排查)默认关闭——省电，心跳自检不受影响
     private static volatile boolean cLog = false;
-    // 朋友圈上传原图（默认关闭；开启后朋友圈发布界面会强制原图键，可能与「制作视频」按钮重叠）
+    // 朋友圈上传原图（默认关闭；开启后朋友圈发布界面会强制原图键）
     private static volatile boolean cMomentsRaw = false;
 
     // ⚠️ 绝不能是 static final 直接 new —— 见类注释
     private static volatile Handler sHandler;
     private static volatile SimpleDateFormat sFmt;
 
-    // ══════════════════════════ 入口 ══════════════════════════
+    // ══════════════════════ 入口 ══════════════════════
 
+    /**
+     * LibXposed 生命周期回调：包已加载、classloader 就绪后调用（无 API level 限制，
+     * onPackageLoaded 是 @RequiresApi(29)，旧设备不触发，故用 onPackageReady）。
+     * 每个包名在进程内只回调一次；scope.list 只声明了微信，所以这里收到的
+     * packageName 只可能是 com.tencent.mm（保险起见仍判断）。
+     */
     @Override
-    public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lp) {
-        if (!Const.WECHAT_PKG.equals(lp.packageName)) return;
-        sProc = lp.processName;
+    public void onPackageReady(PackageReadyParam param) {
+        try {
+            if (!Const.WECHAT_PKG.equals(param.getPackageName())) return;
+            sSelf = this;
+            sProc = myProcName();
+            log("========================================");
+            log("WechatLive v8.7 注入成功  proc=" + sProc);
 
-        log("========================================");
-        log("WechatLive v8.6 注入成功  proc=" + sProc);
+            // 相册只在主进程，重量级 hook 只装主进程，避免 :push/:appbrand 等无谓开销
+            boolean main = Const.WECHAT_PKG.equals(sProc);
+            if (!main) {
+                log("非主进程，跳过 hook 安装");
+                return;
+            }
 
-        // 相册只在主进程，重量级 hook 只装主进程，避免 :push/:appbrand 等无谓开销
-        boolean main = Const.WECHAT_PKG.equals(sProc);
-        if (!main) {
-            log("非主进程，跳过 hook 安装");
-            return;
+            installExtraForcing();
+            installLifecycle();
+            installCompressProbe();
+            installMomentsProbe();
+            installPathCapture();
+            installMomentsCopy();   // v7.7：复制法（用原图替换朋友圈上传临时文件，绕过压缩）
+            installMomentsScaleProbe(); // v7.8：朋友圈缩放探测
+        } catch (Throwable t) {
+            log("onPackageReady 异常: " + t);
         }
+    }
 
-        installExtraForcing();
-        installLifecycle();
-        installCompressProbe();
-        installMomentsProbe();
-        installPathCapture();
-        installMomentsCopy();   // v7.7：复制法（用原图替换朋友圈上传临时文件，绕过压缩）
-        installMomentsScaleProbe(); // v7.8：朋友圈缩放探测（定位内存降采样入口，若注入仍压缩则精准定位）
+    /** 当前进程名。Process.myProcessName() 是 API 28+，反射调用以兼容 Android 8.1。 */
+    private static String myProcName() {
+        try {
+            Method m = android.os.Process.class.getMethod("myProcessName");
+            Object r = m.invoke(null);
+            return r != null ? (String) r : "?";
+        } catch (Throwable t) {
+            return "?";   // 极老设备兜底：非主进程判定会误装 hook，但 force 只在相册界面触发，影响极小
+        }
     }
 
     // ═══════════════ 核心：改写 Intent / Bundle 里的开关键 ═══════════════
@@ -295,26 +326,31 @@ public class MainHook implements IXposedHookLoadPackage {
     private void hookWrite(String clsName, final String method) {
         try {
             Class<?> c = Class.forName(clsName);
-            XposedHelpers.findAndHookMethod(c, method, String.class, boolean.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam p) {
-                            if (!cEnabled) return;
-                            try {
-                                String k = (String) p.args[0];
-                                // v8.6：聊天流程里，界面初始化之后出现的 send_raw_img=false
-                                //      就是用户点掉了「原图」。原样放行，不再改写。
-                                if (noteChatRawOptOut(k, p.args[1])) return;
+            final Method m = findMethod(c, method, String.class, boolean.class);
+            hook(m).intercept(new XposedInterface.Hooker() {
+                @Override
+                public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                    if (cEnabled) {
+                        try {
+                            Object[] args = chain.getArgs().toArray();
+                            String k = (String) args[0];
+                            // v8.6：聊天流程里，界面初始化之后出现的 send_raw_img=false
+                            //      就是用户点掉了「原图」。原样放行，不再改写。
+                            if (!noteChatRawOptOut(k, args[1])) {
                                 Boolean want = desired(k);
-                                if (want != null && !want.equals(p.args[1])) {
-                                    p.args[1] = want;
+                                if (want != null && !want.equals(args[1])) {
+                                    args[1] = want;
                                     sForceCount++;
                                     log("★ FORCE " + method + "  " + k + " : false -> true");
                                 }
-                            } catch (Throwable ignored) {
                             }
+                            return chain.proceed(args);
+                        } catch (Throwable ignored) {
                         }
-                    });
+                    }
+                    return chain.proceed();
+                }
+            });
         } catch (Throwable t) {
             log("hook " + clsName + "#" + method + " 失败: " + t);
         }
@@ -322,51 +358,59 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private void hookReadIntent() {
         try {
-            XposedHelpers.findAndHookMethod(Intent.class, "getBooleanExtra",
-                    String.class, boolean.class, new XC_MethodHook() {
-                        @Override
-                        protected void afterHookedMethod(MethodHookParam p) {
-                            if (!cEnabled) return;
-                            try {
-                                Boolean want = desired((String) p.args[0]);
-                                if (want != null && !want.equals(p.getResult())) {
-                                    p.setResult(want);
-                                    sForceCount++;
-                                    log("★ FORCE getBooleanExtra  " + p.args[0] + " -> true");
-                                }
-                            } catch (Throwable ignored) {
+            final Method m = findMethod(Intent.class, "getBooleanExtra",
+                    String.class, boolean.class);
+            hook(m).intercept(new XposedInterface.Hooker() {
+                @Override
+                public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                    Object result = chain.proceed();
+                    if (cEnabled) {
+                        try {
+                            String key = (String) chain.getArgs().get(0);
+                            Boolean want = desired(key);
+                            if (want != null && !want.equals(result)) {
+                                result = want;
+                                sForceCount++;
+                                log("★ FORCE getBooleanExtra  " + key + " -> true");
                             }
+                        } catch (Throwable ignored) {
                         }
-                    });
+                    }
+                    return result;
+                }
+            });
         } catch (Throwable t) {
             log("hook Intent#getBooleanExtra 失败: " + t);
         }
     }
 
     private void hookReadBundle() {
-        XC_MethodHook h = new XC_MethodHook() {
+        XposedInterface.Hooker h = new XposedInterface.Hooker() {
             @Override
-            protected void afterHookedMethod(MethodHookParam p) {
-                if (!cEnabled) return;
-                try {
-                    Boolean want = desired((String) p.args[0]);
-                    if (want != null && !want.equals(p.getResult())) {
-                        p.setResult(want);
-                        sForceCount++;
-                        log("★ FORCE Bundle.getBoolean  " + p.args[0] + " -> true");
+            public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                Object result = chain.proceed();
+                if (cEnabled) {
+                    try {
+                        String key = (String) chain.getArgs().get(0);
+                        Boolean want = desired(key);
+                        if (want != null && !want.equals(result)) {
+                            result = want;
+                            sForceCount++;
+                            log("★ FORCE Bundle.getBoolean  " + key + " -> true");
+                        }
+                    } catch (Throwable ignored) {
                     }
-                } catch (Throwable ignored) {
                 }
+                return result;
             }
         };
         try {
-            XposedHelpers.findAndHookMethod(Bundle.class, "getBoolean",
-                    String.class, boolean.class, h);
+            hook(findMethod(Bundle.class, "getBoolean", String.class, boolean.class)).intercept(h);
         } catch (Throwable t) {
             log("hook Bundle#getBoolean(String,boolean) 失败: " + t);
         }
         try {
-            XposedHelpers.findAndHookMethod(Bundle.class, "getBoolean", String.class, h);
+            hook(findMethod(Bundle.class, "getBoolean", String.class)).intercept(h);
         } catch (Throwable t) {
             log("hook Bundle#getBoolean(String) 失败: " + t);
         }
@@ -378,46 +422,53 @@ public class MainHook implements IXposedHookLoadPackage {
         // onCreate 时尽早记录前台 Activity（早于 onResume），用于上下文感知强制，
         // 避免朋友圈发布界面在 onCreate 阶段就被误强制出幽灵原图按钮
         try {
-            XposedHelpers.findAndHookMethod(Activity.class, "onCreate", Bundle.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
-                            try {
-                                sCurrentActivity = param.thisObject.getClass().getName();
-                                // v8.1：尽早拿到 ApplicationContext，让自动落盘从第一个 Activity 就能工作
-                                if (sAppCtx == null) {
-                                    sAppCtx = ((Activity) param.thisObject).getApplicationContext();
-                                }
-                                // v7.8：朋友圈发布界面直接把原图键注入 Intent，保证键真实存在。
-                                // 读取侧覆盖值(旧方案)在 SnsUploadUI 的 Intent 不含该键时无效
-                                // （微信可能靠 containsKey 判断），这里在 WeChat 读取前写入 Bundle。
-                                if (cMomentsRaw && isMomentsPublisher(sCurrentActivity)) {
-                                    Intent it = ((Activity) param.thisObject).getIntent();
-                                    if (it != null) {
-                                        it.putExtra(K_SEND_RAW, true);
-                                        it.putExtra(K_SHOW_RAW_BTN, true);
-                                        log("★ [朋友圈注入] SnsUploadUI Intent 已注入 send_raw_img=true");
-                                    }
-                                    // v7.9：此刻微信的图像 native 库已加载，采集一次用于定位编码器
-                                    dumpImageNativeLibs();
-                                }
-                            } catch (Throwable ignored) {
+            final Method onCreate = findMethod(Activity.class, "onCreate", Bundle.class);
+            hook(onCreate).intercept(new XposedInterface.Hooker() {
+                @Override
+                public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                    if (cEnabled) {
+                        try {
+                            Object thiz = chain.getThisObject();
+                            sCurrentActivity = thiz.getClass().getName();
+                            // v8.1：尽早拿到 ApplicationContext，让自动落盘从第一个 Activity 就能工作
+                            if (sAppCtx == null) {
+                                sAppCtx = ((Activity) thiz).getApplicationContext();
                             }
+                            // v7.8：朋友圈发布界面直接把原图键注入 Intent，保证键真实存在。
+                            // 读取侧覆盖值(旧方案)在 SnsUploadUI 的 Intent 不含该键时无效
+                            // （微信可能靠 containsKey 判断），这里在 WeChat 读取前写入 Bundle。
+                            if (cMomentsRaw && isMomentsPublisher(sCurrentActivity)) {
+                                Intent it = ((Activity) thiz).getIntent();
+                                if (it != null) {
+                                    it.putExtra(K_SEND_RAW, true);
+                                    it.putExtra(K_SHOW_RAW_BTN, true);
+                                    log("★ [朋友圈注入] SnsUploadUI Intent 已注入 send_raw_img=true");
+                                }
+                                // v7.9：此刻微信的图像 native 库已加载，采集一次用于定位编码器
+                                dumpImageNativeLibs();
+                            }
+                        } catch (Throwable ignored) {
                         }
-                    });
+                    }
+                    return chain.proceed();
+                }
+            });
             log("已挂载 Activity#onCreate");
         } catch (Throwable t) {
             log("挂载 Activity#onCreate 失败: " + t);
         }
         try {
-            XposedHelpers.findAndHookMethod(Activity.class, "onResume", new XC_MethodHook() {
+            final Method onResume = findMethod(Activity.class, "onResume");
+            hook(onResume).intercept(new XposedInterface.Hooker() {
                 @Override
-                protected void afterHookedMethod(MethodHookParam param) {
+                public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                    Object result = chain.proceed();
                     try {
-                        onResume((Activity) param.thisObject);
+                        onResume((Activity) chain.getThisObject());
                     } catch (Throwable t) {
                         log("onResume handler error: " + t);
                     }
+                    return result;
                 }
             });
             log("已挂载 Activity#onResume");
@@ -427,15 +478,18 @@ public class MainHook implements IXposedHookLoadPackage {
         // v8.1：onPause 兜底落盘。点「发表」后 SnsUploadUI 会 finish，
         // onPause 是它生命周期里最后一个可靠回调，此时把日志刷出去。
         try {
-            XposedHelpers.findAndHookMethod(Activity.class, "onPause", new XC_MethodHook() {
+            final Method onPause = findMethod(Activity.class, "onPause");
+            hook(onPause).intercept(new XposedInterface.Hooker() {
                 @Override
-                protected void afterHookedMethod(MethodHookParam param) {
+                public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                    Object result = chain.proceed();
                     try {
-                        Context c = ((Activity) param.thisObject).getApplicationContext();
+                        Context c = ((Activity) chain.getThisObject()).getApplicationContext();
                         if (sAppCtx == null) sAppCtx = c;
                         flushLog(c);
                     } catch (Throwable ignored) {
                     }
+                    return result;
                 }
             });
             log("已挂载 Activity#onPause（日志兜底落盘）");
@@ -455,112 +509,123 @@ public class MainHook implements IXposedHookLoadPackage {
      */
     private void installCompressProbe() {
         try {
-            XposedHelpers.findAndHookMethod(android.graphics.Bitmap.class,
+            final Method compress = findMethod(android.graphics.Bitmap.class,
                     "compress",
                     android.graphics.Bitmap.CompressFormat.class,
                     int.class,
-                    java.io.OutputStream.class,
-                    new XC_MethodHook() {
-                        private int logged = 0;
+                    java.io.OutputStream.class);
+            hook(compress).intercept(new XposedInterface.Hooker() {
+                private int logged = 0;
 
-                        /** v8.0：在编码前介入——首选原图字节直塞，兜底把 quality 拉满 */
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam p) {
-                            if (!cMomentsRaw || sInjecting) return;
-                            try {
-                                android.graphics.Bitmap bmp = (android.graphics.Bitmap) p.thisObject;
-                                if (bmp == null || bmp.isRecycled()) return;
-                                int w = bmp.getWidth(), h = bmp.getHeight();
-                                // 只处理「上传级主图」：>200 万像素。缩略图一律不动。
-                                if ((long) w * h < 2000000L) return;
-                                // v8.2：放宽门槛。主图 compress 可能在「上传线程」上、调用栈不含
-                                // plugin.sns（缩略图却在），故改为「当前界面是朋友圈/相册」或「栈含 sns」任一即可。
-                                boolean near = nearSns();
-                                boolean ins = inSnsStack();
-                                if (!near && !ins) return;
-                                // 诊断：确认主图 compress 是否真的走到这里（之前日志里完全看不到主图 compress）
-                                if (sMainProbe < 4) {
-                                    sMainProbe++;
-                                    log("★ [主图compress] reached " + w + "x" + h
-                                            + " nearSns=" + near + " inSnsStack=" + ins);
-                                }
+                @Override
+                public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                    // ── before 部分（原 beforeHookedMethod）──
+                    Object[] newArgs = null;
+                    boolean shortCircuit = false;
+                    if (cMomentsRaw && !sInjecting) {
+                        try {
+                            android.graphics.Bitmap bmp = (android.graphics.Bitmap) chain.getThisObject();
+                            if (bmp == null || bmp.isRecycled()) return chain.proceed();
+                            int w = bmp.getWidth(), h = bmp.getHeight();
+                            // 只处理「上传级主图」：>200 万像素。缩略图一律不动。
+                            if ((long) w * h < 2000000L) return chain.proceed();
+                            // v8.2：放宽门槛。主图 compress 可能在「上传线程」上、调用栈不含
+                            // plugin.sns（缩略图却在），故改为「当前界面是朋友圈/相册」或「栈含 sns」任一即可。
+                            boolean near = nearSns();
+                            boolean ins = inSnsStack();
+                            if (!near && !ins) return chain.proceed();
+                            // 诊断：确认主图 compress 是否真的走到这里（之前日志里完全看不到主图 compress）
+                            if (sMainProbe < 4) {
+                                sMainProbe++;
+                                log("★ [主图compress] reached " + w + "x" + h
+                                        + " nearSns=" + near + " inSnsStack=" + ins);
+                            }
 
-                                boolean jpeg = String.valueOf(p.args[0]).toUpperCase(Locale.US).contains("JPEG");
+                            Object[] args = chain.getArgs().toArray();
+                            boolean jpeg = String.valueOf(args[0]).toUpperCase(Locale.US).contains("JPEG");
 
-                                // ① 首选：把原始 JPEG 文件字节直接写进输出流。
-                                //    这样微信拿到的就是磁盘上那份原图本身——画质 100% 无损，
-                                //    且 EXIF（APP1 段在文件头部）原样保留。
-                                if (jpeg && sRawInjected < 8) {
-                                    String src = pickOriginalFor(w, h);
-                                    if (src != null) {
-                                        long n = pumpOriginalInto(src, (java.io.OutputStream) p.args[2]);
-                                        if (n > 0) {
-                                            sRawInjected++;
-                                            p.setResult(Boolean.TRUE);   // 短路：微信不再自己编码
-                                            log("★ [原图直塞] " + w + "x" + h + " 已写入原始 JPEG "
-                                                    + n + " 字节（EXIF 保留）第 " + sRawInjected + " 次"
-                                                    + "\n    src=" + src);
-                                            return;
-                                        }
+                            // ① 首选：把原始 JPEG 文件字节直接写进输出流。
+                            //    这样微信拿到的就是磁盘上那份原图本身——画质 100% 无损，
+                            //    且 EXIF（APP1 段在文件头部）原样保留。
+                            if (jpeg && sRawInjected < 8) {
+                                String src = pickOriginalFor(w, h);
+                                if (src != null) {
+                                    long n = pumpOriginalInto(src, (java.io.OutputStream) args[2]);
+                                    if (n > 0) {
+                                        sRawInjected++;
+                                        shortCircuit = true;
+                                        log("★ [原图直塞] " + w + "x" + h + " 已写入原始 JPEG "
+                                                + n + " 字节（EXIF 保留）第 " + sRawInjected + " 次"
+                                                + "\n    src=" + src);
+                                    } else {
                                         log("★ [直塞决策] 匹配到 " + shortPath(src) + " 但写入失败，退兜底");
-                                    } else if (sDecisionLogged < 6) {
-                                        // v8.1：没命中一定要说清为什么，否则下一版只能靠猜。
-                                        sDecisionLogged++;
-                                        log("★ [直塞决策] 未匹配 目标=" + w + "x" + h
-                                                + " " + candidateSummary());
                                     }
-                                } else if (!jpeg && sDecisionLogged < 6) {
+                                } else if (sDecisionLogged < 6) {
+                                    // v8.1：没命中一定要说清为什么，否则下一版只能靠猜。
                                     sDecisionLogged++;
-                                    log("★ [直塞决策] 跳过：非 JPEG 编码 format=" + p.args[0]
-                                            + " 尺寸=" + w + "x" + h);
+                                    log("★ [直塞决策] 未匹配 目标=" + w + "x" + h
+                                            + " " + candidateSummary());
                                 }
+                            } else if (!jpeg && sDecisionLogged < 6) {
+                                sDecisionLogged++;
+                                log("★ [直塞决策] 跳过：非 JPEG 编码 format=" + args[0]
+                                        + " 尺寸=" + w + "x" + h);
+                            }
 
-                                // ② 兜底：找不到可用原图时，至少把编码质量拉满（实测微信写死 70）
-                                Object q0 = p.args[1];
+                            // ② 兜底：找不到可用原图时，至少把编码质量拉满（实测微信写死 70）
+                            if (!shortCircuit) {
+                                Object q0 = args[1];
                                 int q = (q0 instanceof Integer) ? (Integer) q0 : 100;
                                 if (q < 100) {
-                                    p.args[1] = 100;
+                                    args[1] = 100;
+                                    newArgs = args;
                                     if (sQualityBoost < 12) {
                                         sQualityBoost++;
                                         log("★ [质量提升] " + w + "x" + h
                                                 + " compress quality " + q + " → 100（未匹配到原图，走无损重编码）");
                                     }
                                 }
-                            } catch (Throwable t) {
-                                log("compress 干预异常: " + t);
                             }
+                        } catch (Throwable t) {
+                            log("compress 干预异常: " + t);
                         }
+                    }
+                    // 直塞成功：短路，微信不再自己编码
+                    if (shortCircuit) return Boolean.TRUE;
 
-                        @Override
-                        protected void afterHookedMethod(MethodHookParam p) {
-                            if (!cMomentsRaw || !cVerbose || logged >= 8) return;
-                            try {
-                                android.graphics.Bitmap bmp = (android.graphics.Bitmap) p.thisObject;
-                                if (bmp == null || bmp.isRecycled()) return;
-                                int area = bmp.getWidth() * bmp.getHeight();
-                                if (area < 100000) return; // 只关心上传级大图压缩，忽略缩略图
-                                StackTraceElement[] st = new Throwable().getStackTrace();
-                                boolean sns = false;
-                                StringBuilder sb = new StringBuilder();
-                                for (StackTraceElement e : st) {
-                                    String cn = e.getClassName();
-                                    if (cn.contains("plugin.sns") || cn.contains(".sns.")
-                                            || cn.endsWith(".sns.ui") || cn.contains("sns.model")) {
-                                        sns = true;
-                                    }
-                                    if (sb.length() < 1400) {
-                                        sb.append("\n    ").append(cn).append('.').append(e.getMethodName());
-                                    }
-                                    if (sb.length() >= 1400) break;
+                    Object result = newArgs != null ? chain.proceed(newArgs) : chain.proceed();
+
+                    // ── after 部分（原 afterHookedMethod）──
+                    if (cMomentsRaw && cVerbose && logged < 8) {
+                        try {
+                            android.graphics.Bitmap bmp = (android.graphics.Bitmap) chain.getThisObject();
+                            if (bmp == null || bmp.isRecycled()) return result;
+                            int area = bmp.getWidth() * bmp.getHeight();
+                            if (area < 100000) return result; // 只关心上传级大图压缩，忽略缩略图
+                            StackTraceElement[] st = new Throwable().getStackTrace();
+                            boolean sns = false;
+                            StringBuilder sb = new StringBuilder();
+                            for (StackTraceElement e : st) {
+                                String cn = e.getClassName();
+                                if (cn.contains("plugin.sns") || cn.contains(".sns.")
+                                        || cn.endsWith(".sns.ui") || cn.contains("sns.model")) {
+                                    sns = true;
                                 }
-                                if (!sns) return;
-                                logged++;
-                                log("★ [朋友圈压缩探测] Bitmap.compress 面积=" + area
-                                        + " quality=" + p.args[1] + " 调用栈(top→底):" + sb);
-                            } catch (Throwable ignored) {
+                                if (sb.length() < 1400) {
+                                    sb.append("\n    ").append(cn).append('.').append(e.getMethodName());
+                                }
+                                if (sb.length() >= 1400) break;
                             }
+                            if (!sns) return result;
+                            logged++;
+                            log("★ [朋友圈压缩探测] Bitmap.compress 面积=" + area
+                                    + " quality=" + chain.getArgs().get(1) + " 调用栈(top→底):" + sb);
+                        } catch (Throwable ignored) {
                         }
-                    });
+                    }
+                    return result;
+                }
+            });
             log("已挂载 Bitmap.compress 原图直塞 / 质量拉满（v8.0）");
         } catch (Throwable t) {
             log("挂载 Bitmap.compress 干预失败: " + t);
@@ -867,24 +932,27 @@ public class MainHook implements IXposedHookLoadPackage {
      * 开关关闭时完全不挂载热路径（零开销）。
      */
     private void installMomentsProbe() {
-        XC_MethodHook logWrite = new XC_MethodHook() {
+        XposedInterface.Hooker logWrite = new XposedInterface.Hooker() {
             private int logged = 0;
             private final Set<String> seen = new HashSet<String>();
+
             @Override
-            protected void afterHookedMethod(MethodHookParam p) {
-                if (sCopying || sSweeping || !cMomentsRaw || logged >= 60) return;
+            public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                Object result = chain.proceed();
+                if (sCopying || sSweeping || !cMomentsRaw || logged >= 60) return result;
                 try {
-                    Object a0 = p.args[0];
+                    Object a0 = chain.getArgs().get(0);
                     String path = a0 instanceof File ? ((File) a0).getAbsolutePath()
                             : (a0 instanceof String ? (String) a0 : null);
-                    if (path == null || !isMomentsFile(path)) return;
+                    if (path == null || !isMomentsFile(path)) return result;
                     // 记录「图片类临时文件」(base / _parse / _remux_thumb，排除纯视频 remux)，
                     // 供复制法在流关闭后把原图覆盖进去。
-                    if (isImageTemp(path)) {
-                        sFosTemp.put(p.thisObject, path);
+                    Object thiz = chain.getThisObject();
+                    if (isImageTemp(path) && thiz != null) {
+                        sFosTemp.put(thiz, path);
                     }
-                    if (!cVerbose) return;      // v8.1：写探测纯诊断，默认不打，避免淹没关键日志
-                    if (seen.contains(path)) return;
+                    if (!cVerbose) return result;      // v8.1：写探测纯诊断，默认不打，避免淹没关键日志
+                    if (seen.contains(path)) return result;
                     seen.add(path);
                     logged++;
                     // v8.1：不再打完整调用栈（一条 30+ 行，1418 行日志里 889 行都是它）
@@ -893,62 +961,70 @@ public class MainHook implements IXposedHookLoadPackage {
                     log("★ [写] " + shortPath(path) + (sz > 0 ? " 追加于 " + sz + "B" : " (新建)"));
                 } catch (Throwable ignored) {
                 }
+                return result;
             }
         };
-        try { XposedHelpers.findAndHookConstructor(FileOutputStream.class, File.class, logWrite); }
+        try { hook(findCtor(FileOutputStream.class, File.class)).intercept(logWrite); }
         catch (Throwable t) { log("hook FOS(File) 失败: " + t); }
-        try { XposedHelpers.findAndHookConstructor(FileOutputStream.class, File.class, boolean.class, logWrite); }
+        try { hook(findCtor(FileOutputStream.class, File.class, boolean.class)).intercept(logWrite); }
         catch (Throwable t) { log("hook FOS(File,bool) 失败: " + t); }
-        try { XposedHelpers.findAndHookConstructor(FileOutputStream.class, String.class, logWrite); }
+        try { hook(findCtor(FileOutputStream.class, String.class)).intercept(logWrite); }
         catch (Throwable t) { log("hook FOS(String) 失败: " + t); }
-        try { XposedHelpers.findAndHookConstructor(FileOutputStream.class, String.class, boolean.class, logWrite); }
+        try { hook(findCtor(FileOutputStream.class, String.class, boolean.class)).intercept(logWrite); }
         catch (Throwable t) { log("hook FOS(String,bool) 失败: " + t); }
 
-        XC_MethodHook logRaf = new XC_MethodHook() {
+        XposedInterface.Hooker logRaf = new XposedInterface.Hooker() {
             private int logged = 0;
             private final Set<String> seen = new HashSet<String>();
+
             @Override
-            protected void afterHookedMethod(MethodHookParam p) {
-                if (sSweeping || !cMomentsRaw || logged >= 20) return;
+            public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                Object result = chain.proceed();
+                if (sSweeping || !cMomentsRaw || logged >= 20) return result;
                 try {
-                    Object a0 = p.args[0];
+                    Object a0 = chain.getArgs().get(0);
                     String path = a0 instanceof File ? ((File) a0).getAbsolutePath()
                             : (a0 instanceof String ? (String) a0 : null);
-                    if (path == null || !isMomentsFile(path)) return;
-                    if (!cVerbose) return;      // v8.1：RAF 探测纯诊断，默认不打
-                    if (seen.contains(path)) return;
+                    if (path == null || !isMomentsFile(path)) return result;
+                    if (!cVerbose) return result;      // v8.1：RAF 探测纯诊断，默认不打
+                    if (seen.contains(path)) return result;
                     seen.add(path);
                     logged++;
                     log("★ [RAF] " + shortPath(path));
                 } catch (Throwable ignored) {
                 }
+                return result;
             }
         };
-        try { XposedHelpers.findAndHookConstructor(RandomAccessFile.class, File.class, String.class, logRaf); }
+        try { hook(findCtor(RandomAccessFile.class, File.class, String.class)).intercept(logRaf); }
         catch (Throwable t) { log("hook RAF(File,mode) 失败: " + t); }
-        try { XposedHelpers.findAndHookConstructor(RandomAccessFile.class, String.class, String.class, logRaf); }
+        try { hook(findCtor(RandomAccessFile.class, String.class, String.class)).intercept(logRaf); }
         catch (Throwable t) { log("hook RAF(String,mode) 失败: " + t); }
 
         try {
-            XposedHelpers.findAndHookMethod(android.graphics.BitmapFactory.class, "decodeFile",
-                    String.class, new XC_MethodHook() {
-                        private int logged = 0;
-                        private final Set<String> seen = new HashSet<String>();
-                        @Override
-                        protected void afterHookedMethod(MethodHookParam p) {
-                            if (!cMomentsRaw || logged >= 30) return;
-                            try {
-                                String path = (String) p.args[0];
-                                if (path == null || !isMomentsFile(path)) return;
-                                if (!cVerbose) return;      // v8.1：读探测纯诊断，默认不打
-                                if (seen.contains(path)) return;
-                                seen.add(path);
-                                logged++;
-                                log("★ [读] " + shortPath(path));
-                            } catch (Throwable ignored) {
-                            }
-                        }
-                    });
+            final Method df = findMethod(android.graphics.BitmapFactory.class, "decodeFile",
+                    String.class);
+            hook(df).intercept(new XposedInterface.Hooker() {
+                private int logged = 0;
+                private final Set<String> seen = new HashSet<String>();
+
+                @Override
+                public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                    Object result = chain.proceed();
+                    if (!cMomentsRaw || logged >= 30) return result;
+                    try {
+                        String path = (String) chain.getArgs().get(0);
+                        if (path == null || !isMomentsFile(path)) return result;
+                        if (!cVerbose) return result;      // v8.1：读探测纯诊断，默认不打
+                        if (seen.contains(path)) return result;
+                        seen.add(path);
+                        logged++;
+                        log("★ [读] " + shortPath(path));
+                    } catch (Throwable ignored) {
+                    }
+                    return result;
+                }
+            });
         } catch (Throwable t) { log("hook BitmapFactory.decodeFile 失败: " + t); }
 
         log("已挂载朋友圈文件读写探针(v7.6: 命中即报路径+大小+完整栈；发朋友圈并点发表后可抓压缩/读取栈)");
@@ -973,22 +1049,23 @@ public class MainHook implements IXposedHookLoadPackage {
      */
     private void installMomentsCopy() {
         // ① 源捕获：微信在压缩链里用 FileInputStream 读原图
-        XC_MethodHook srcHook = new XC_MethodHook() {
+        XposedInterface.Hooker srcHook = new XposedInterface.Hooker() {
             @Override
-            protected void afterHookedMethod(MethodHookParam p) {
-                if (sCopying || sInjecting || sSweeping || !cMomentsRaw) return;
+            public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                Object result = chain.proceed();
+                if (sCopying || sInjecting || sSweeping || !cMomentsRaw) return result;
                 try {
-                    Object a0 = p.args[0];
+                    Object a0 = chain.getArgs().get(0);
                     String path = a0 instanceof File ? ((File) a0).getAbsolutePath()
                             : (a0 instanceof String ? (String) a0 : null);
-                    if (path == null) return;
+                    if (path == null) return result;
                     // v8.0：只认用户相册里的真实照片（/storage 下的 jpg）。
                     // 旧版本把微信内置 emoji / wxa 模板 png 也当原图记下来，日志噪音极大且会污染匹配。
-                    if (!isUserPhoto(path)) return;
+                    if (!isUserPhoto(path)) return result;
                     // v8.1 放宽：只要当前处在朋友圈/相册上下文，读到的相册照片一律纳入候选。
                     // 旧版要求调用栈含特定 sns 类名，结果两张图只抓到一张——另一张走了
                     // 别的读取路径。候选池最终还要按尺寸精确匹配，多收几个没有副作用。
-                    if (!nearSns() && !looksLikeGallery(sCurrentActivity)) return;
+                    if (!nearSns() && !looksLikeGallery(sCurrentActivity)) return result;
                     boolean isNew;
                     synchronized (sPhotoCandidates) {
                         isNew = !sPhotoCandidates.contains(path);
@@ -998,64 +1075,68 @@ public class MainHook implements IXposedHookLoadPackage {
                     if (isNew) log("★ [朋友圈原图读取] path=" + path);
                 } catch (Throwable ignored) {
                 }
+                return result;
             }
         };
-        try { XposedHelpers.findAndHookConstructor(FileInputStream.class, File.class, srcHook); }
+        try { hook(findCtor(FileInputStream.class, File.class)).intercept(srcHook); }
         catch (Throwable t) { log("hook FIS(File) 失败: " + t); }
-        try { XposedHelpers.findAndHookConstructor(FileInputStream.class, String.class, srcHook); }
+        try { hook(findCtor(FileInputStream.class, String.class)).intercept(srcHook); }
         catch (Throwable t) { log("hook FIS(String) 失败: " + t); }
 
         // ② 覆盖：FileOutputStream 关闭后，按临时文件「当前尺寸」静默匹配原图并覆盖
         //    v8.2：不再用单一 sLastOriginalPath（多图时会被串味），改为读临时文件尺寸，
         //    在候选池+相册目录里找尺寸一致的原图——编码器无关，主图走哪条编码链都能接住。
         try {
-            XposedHelpers.findAndHookMethod(FileOutputStream.class, "close", new XC_MethodHook() {
+            final Method close = findMethod(FileOutputStream.class, "close");
+            hook(close).intercept(new XposedInterface.Hooker() {
                 @Override
-            protected void afterHookedMethod(MethodHookParam p) {
-                if (sCopying || sSweeping || !cMomentsRaw) return;
-                try {
-                    String temp = sFosTemp.remove(p.thisObject);
-                    if (temp == null) return;
-                    if (isVideoRemux(temp)) return;   // 实况视频流，绝不覆盖
-                    int[] twh = boundsOf(temp);       // 临时文件已被微信写入（重编码后）的尺寸
-                    if (twh == null || twh[0] <= 0 || twh[1] <= 0) {
-                        if (sCopyLogged < 6) { sCopyLogged++;
-                            log("★ [复制法跳过] 临时文件无法读尺寸 temp=" + shortPath(temp));
-                        }
-                        return;
-                    }
-                    String orig = findOriginalForDims(twh[0], twh[1]);
-                    if (orig != null) {
-                        int r = overwriteTempWithOriginal(temp, orig);
-                        if (r == COPY_WRITTEN) {
-                            sCopyInjected++;
-                            log("★ [复制法注入] temp=" + shortPath(temp) + " " + twh[0] + "x" + twh[1]
-                                    + " ← " + shortPath(orig) + " 已覆盖 " + safeSize(temp)
-                                    + "B 第" + sCopyInjected + "次");
-                        } else if (r == COPY_SAME) {
-                            sRawSame++;
-                            log("★ [原图确认] temp=" + shortPath(temp) + " " + twh[0] + "x" + twh[1]
-                                    + " 与原图 " + shortPath(orig) + " 字节完全一致 " + safeSize(temp)
-                                    + "B（微信原图模式已生效）第" + sRawSame + "次");
-                        }
-                        // v8.4：把「此刻已验证正确」的 temp→原图 配对钉死。
-                        // 后续核验只认这张表——绝不再按尺寸重查（多图同尺寸会串到同一张，
-                        // v8.3 因此把正确的图覆盖成了别人的照片）。
-                        if (r == COPY_WRITTEN || r == COPY_SAME) {
-                            synchronized (sTempOrig) {
-                                if (sTempOrig.size() < 64) sTempOrig.put(temp, orig);
+                public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                    Object result = chain.proceed();
+                    if (sCopying || sSweeping || !cMomentsRaw) return result;
+                    try {
+                        String temp = sFosTemp.remove(chain.getThisObject());
+                        if (temp == null) return result;
+                        if (isVideoRemux(temp)) return result;   // 实况视频流，绝不覆盖
+                        int[] twh = boundsOf(temp);       // 临时文件已被微信写入（重编码后）的尺寸
+                        if (twh == null || twh[0] <= 0 || twh[1] <= 0) {
+                            if (sCopyLogged < 6) { sCopyLogged++;
+                                log("★ [复制法跳过] 临时文件无法读尺寸 temp=" + shortPath(temp));
                             }
+                            return result;
                         }
-                        // 微信有可能在流关闭之后再重编码一次，安排一次延迟核验兜底
-                        rememberDraftDir(temp);
-                        scheduleSweep();
-                    } else if (sCopyLogged < 6) {
-                        sCopyLogged++;
-                        log("★ [复制法跳过] 无尺寸匹配原图 temp=" + shortPath(temp)
-                                + " " + twh[0] + "x" + twh[1] + " " + candidateSummary());
+                        String orig = findOriginalForDims(twh[0], twh[1]);
+                        if (orig != null) {
+                            int r = overwriteTempWithOriginal(temp, orig);
+                            if (r == COPY_WRITTEN) {
+                                sCopyInjected++;
+                                log("★ [复制法注入] temp=" + shortPath(temp) + " " + twh[0] + "x" + twh[1]
+                                        + " ← " + shortPath(orig) + " 已覆盖 " + safeSize(temp)
+                                        + "B 第" + sCopyInjected + "次");
+                            } else if (r == COPY_SAME) {
+                                sRawSame++;
+                                log("★ [原图确认] temp=" + shortPath(temp) + " " + twh[0] + "x" + twh[1]
+                                        + " 与原图 " + shortPath(orig) + " 字节完全一致 " + safeSize(temp)
+                                        + "B（微信原图模式已生效）第" + sRawSame + "次");
+                            }
+                            // v8.4：把「此刻已验证正确」的 temp→原图 配对钉死。
+                            // 后续核验只认这张表——绝不再按尺寸重查（多图同尺寸会串到同一张，
+                            // v8.3 因此把正确的图覆盖成了别人的照片）。
+                            if (r == COPY_WRITTEN || r == COPY_SAME) {
+                                synchronized (sTempOrig) {
+                                    if (sTempOrig.size() < 64) sTempOrig.put(temp, orig);
+                                }
+                            }
+                            // 微信有可能在流关闭之后再重编码一次，安排一次延迟核验兜底
+                            rememberDraftDir(temp);
+                            scheduleSweep();
+                        } else if (sCopyLogged < 6) {
+                            sCopyLogged++;
+                            log("★ [复制法跳过] 无尺寸匹配原图 temp=" + shortPath(temp)
+                                    + " " + twh[0] + "x" + twh[1] + " " + candidateSummary());
+                        }
+                    } catch (Throwable ignored) {
                     }
-                } catch (Throwable ignored) {
-                }
+                    return result;
                 }
             });
             log("已挂载 朋友圈复制法（原图覆盖上传临时文件，v8.2 按尺寸匹配）");
@@ -1075,53 +1156,61 @@ public class MainHook implements IXposedHookLoadPackage {
      */
     private void installMomentsScaleProbe() {
         // ① Bitmap.createScaledBitmap —— 探测 + 拦截（命中即短路返回原图，等于取消降采样）
-        XC_MethodHook scale = new XC_MethodHook() {
+        XposedInterface.Hooker scale = new XposedInterface.Hooker() {
             @Override
-            protected void beforeHookedMethod(MethodHookParam p) {
-                if (!cMomentsRaw) return;
-                try {
-                    android.graphics.Bitmap src = (android.graphics.Bitmap) p.args[0];
-                    if (src == null || src.isRecycled()) return;
-                    int sw = src.getWidth(), sh = src.getHeight();
-                    if (sw * sh < 100000) return;   // 只关心上传级大图降采样
-                    int dw = (Integer) p.args[1];
-                    int dh = (Integer) p.args[2];
-                    boolean shrink = (dw < sw || dh < sh);
-                    if (!shrink) return;
-                    if (!nearSns()) return;             // 廉价前置：不在朋友圈相关界面直接跳过
-                    boolean sns = inSnsStack();
-                    if (sScaleLogged < 12) {
-                        sScaleLogged++;
-                        log("★ [朋友圈缩放探测] 源=" + sw + "x" + sh + " -> 目标=" + dw + "x" + dh
-                                + "  sns=" + sns + "  " + p.method.getName()
-                                + "\n    栈: " + stackBrief());
+            public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                if (cMomentsRaw) {
+                    try {
+                        Object[] args = chain.getArgs().toArray();
+                        android.graphics.Bitmap src = (android.graphics.Bitmap) args[0];
+                        if (src != null && !src.isRecycled()) {
+                            int sw = src.getWidth(), sh = src.getHeight();
+                            if (sw * sh >= 100000) {   // 只关心上传级大图降采样
+                                int dw = (Integer) args[1];
+                                int dh = (Integer) args[2];
+                                boolean shrink = (dw < sw || dh < sh);
+                                if (shrink) {
+                                    if (nearSns()) {             // 廉价前置：不在朋友圈相关界面直接跳过
+                                        boolean sns = inSnsStack();
+                                        if (sScaleLogged < 12) {
+                                            sScaleLogged++;
+                                            log("★ [朋友圈缩放探测] 源=" + sw + "x" + sh + " -> 目标=" + dw + "x" + dh
+                                                    + "  sns=" + sns + "  " + chain.getExecutable().getName()
+                                                    + "\n    栈: " + stackBrief());
+                                        }
+                                        // 仅拦截 sns 上下文下的「上传级大图」降采样：源长边 > 2560 说明这是原图在被压。
+                                        // ⚠ 必须同时要求「目标也是大图」(长边 >= 1000)：
+                                        //   实测预览阶段会有 4096x3072 -> 267x200 这类缩略图缩放，若也拦截，
+                                        //   相当于拿 48MB 的全尺寸 Bitmap 去当 267x200 的缩略图用，十几次就 OOM/卡死。
+                                        if (sns && Math.max(sw, sh) > 2560 && Math.max(dw, dh) >= 1000
+                                                && sBlocked < 24) {
+                                            sBlocked++;
+                                            log("★ [朋友圈拦截] 已阻止降采样 " + sw + "x" + sh + " -> " + dw + "x" + dh
+                                                    + "（返回原图，第 " + sBlocked + " 次）");
+                                            return src;   // 短路：直接返回原图，取消这次降采样
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } catch (Throwable ignored) {
                     }
-                    // 仅拦截 sns 上下文下的「上传级大图」降采样：源长边 > 2560 说明这是原图在被压。
-                    // ⚠ 必须同时要求「目标也是大图」(长边 >= 1000)：
-                    //   实测预览阶段会有 4096x3072 -> 267x200 这类缩略图缩放，若也拦截，
-                    //   相当于拿 48MB 的全尺寸 Bitmap 去当 267x200 的缩略图用，十几次就 OOM/卡死。
-                    if (sns && Math.max(sw, sh) > 2560 && Math.max(dw, dh) >= 1000 && sBlocked < 24) {
-                        sBlocked++;
-                        p.setResult(src);   // 直接返回原图，取消这次降采样
-                        log("★ [朋友圈拦截] 已阻止降采样 " + sw + "x" + sh + " -> " + dw + "x" + dh
-                                + "（返回原图，第 " + sBlocked + " 次）");
-                    }
-                } catch (Throwable ignored) {
                 }
+                return chain.proceed();
             }
         };
         try {
-            XposedHelpers.findAndHookMethod(android.graphics.Bitmap.class, "createScaledBitmap",
-                    android.graphics.Bitmap.class, int.class, int.class, boolean.class, scale);
+            hook(findMethod(android.graphics.Bitmap.class, "createScaledBitmap",
+                    android.graphics.Bitmap.class, int.class, int.class, boolean.class)).intercept(scale);
             log("已挂载 Bitmap.createScaledBitmap 缩放拦截");
         } catch (Throwable t) {
             log("hook createScaledBitmap 失败: " + t);
         }
         try {
-            XposedHelpers.findAndHookMethod(android.media.ThumbnailUtils.class, "extractThumbnail",
-                    android.graphics.Bitmap.class, int.class, int.class, scale);
-            XposedHelpers.findAndHookMethod(android.media.ThumbnailUtils.class, "extractThumbnail",
-                    android.graphics.Bitmap.class, int.class, int.class, int.class, scale);
+            hook(findMethod(android.media.ThumbnailUtils.class, "extractThumbnail",
+                    android.graphics.Bitmap.class, int.class, int.class)).intercept(scale);
+            hook(findMethod(android.media.ThumbnailUtils.class, "extractThumbnail",
+                    android.graphics.Bitmap.class, int.class, int.class, int.class)).intercept(scale);
             log("已挂载 ThumbnailUtils.extractThumbnail 缩放拦截");
         } catch (Throwable t) {
             log("hook ThumbnailUtils 失败: " + t);
@@ -1130,38 +1219,44 @@ public class MainHook implements IXposedHookLoadPackage {
         // ② Bitmap.createBitmap(src, x,y,w,h, Matrix, filter) —— Matrix 缩放路径（createScaledBitmap 的底层，
         //    也是自研压缩代码最常用的入口）。若 Matrix 是「缩小」且源为上传级大图，则去掉变换。
         try {
-            XposedHelpers.findAndHookMethod(android.graphics.Bitmap.class, "createBitmap",
+            final Method cb = findMethod(android.graphics.Bitmap.class, "createBitmap",
                     android.graphics.Bitmap.class, int.class, int.class, int.class, int.class,
-                    android.graphics.Matrix.class, boolean.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam p) {
-                            if (!cMomentsRaw) return;
-                            try {
-                                android.graphics.Matrix m = (android.graphics.Matrix) p.args[5];
-                                if (m == null) return;
-                                android.graphics.Bitmap src = (android.graphics.Bitmap) p.args[0];
-                                if (src == null || src.isRecycled()) return;
-                                if (Math.max(src.getWidth(), src.getHeight()) <= 2560) return;
-                                float[] v = new float[9];
-                                m.getValues(v);
-                                float sx = Math.abs(v[0]), sy = Math.abs(v[4]);
-                                // 只处理纯缩放（无旋转/错切），且确实在缩小
-                                if (Math.abs(v[1]) > 0.001f || Math.abs(v[3]) > 0.001f) return;
-                                if (sx >= 0.98f && sy >= 0.98f) return;
-                                if (sx < 0.05f || sy < 0.05f) return;   // 极小缩略图不动
-                                if (!nearSns() || !inSnsStack()) return;
-                                if (sMatrixBlocked >= 24) return;
-                                sMatrixBlocked++;
-                                p.args[5] = null;   // 去掉缩放变换 → 输出原尺寸
-                                log("★ [朋友圈拦截] Matrix 缩放已取消 sx=" + sx + " sy=" + sy
-                                        + " 源=" + src.getWidth() + "x" + src.getHeight()
-                                        + "（第 " + sMatrixBlocked + " 次）"
-                                        + (sMatrixBlocked <= 3 ? "\n    栈: " + stackBrief() : ""));
-                            } catch (Throwable ignored) {
+                    android.graphics.Matrix.class, boolean.class);
+            hook(cb).intercept(new XposedInterface.Hooker() {
+                @Override
+                public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                    if (cMomentsRaw) {
+                        try {
+                            Object[] args = chain.getArgs().toArray();
+                            android.graphics.Matrix m = (android.graphics.Matrix) args[5];
+                            if (m != null) {
+                                android.graphics.Bitmap src = (android.graphics.Bitmap) args[0];
+                                if (src != null && !src.isRecycled()) {
+                                    if (Math.max(src.getWidth(), src.getHeight()) <= 2560) return chain.proceed();
+                                    float[] v = new float[9];
+                                    m.getValues(v);
+                                    float sx = Math.abs(v[0]), sy = Math.abs(v[4]);
+                                    // 只处理纯缩放（无旋转/错切），且确实在缩小
+                                    if (Math.abs(v[1]) > 0.001f || Math.abs(v[3]) > 0.001f) return chain.proceed();
+                                    if (sx >= 0.98f && sy >= 0.98f) return chain.proceed();
+                                    if (sx < 0.05f || sy < 0.05f) return chain.proceed();   // 极小缩略图不动
+                                    if (!nearSns() || !inSnsStack()) return chain.proceed();
+                                    if (sMatrixBlocked >= 24) return chain.proceed();
+                                    sMatrixBlocked++;
+                                    args[5] = null;   // 去掉缩放变换 → 输出原尺寸
+                                    log("★ [朋友圈拦截] Matrix 缩放已取消 sx=" + sx + " sy=" + sy
+                                            + " 源=" + src.getWidth() + "x" + src.getHeight()
+                                            + "（第 " + sMatrixBlocked + " 次）"
+                                            + (sMatrixBlocked <= 3 ? "\n    栈: " + stackBrief() : ""));
+                                    return chain.proceed(args);
+                                }
                             }
+                        } catch (Throwable ignored) {
                         }
-                    });
+                    }
+                    return chain.proceed();
+                }
+            });
             log("已挂载 Bitmap.createBitmap(Matrix) 缩放拦截");
         } catch (Throwable t) {
             log("hook createBitmap(Matrix) 失败: " + t);
@@ -1169,53 +1264,58 @@ public class MainHook implements IXposedHookLoadPackage {
 
         // ③ BitmapFactory 解码降采样：inSampleSize>1 / inScaled 会在「解码阶段」就把图缩小。
         //    sns 上下文下强制全尺寸解码。
-        XC_MethodHook decOpt = new XC_MethodHook() {
+        XposedInterface.Hooker decOpt = new XposedInterface.Hooker() {
             @Override
-            protected void beforeHookedMethod(MethodHookParam p) {
-                if (!cMomentsRaw) return;
-                try {
-                    android.graphics.BitmapFactory.Options o = null;
-                    for (Object a : p.args) {
-                        if (a instanceof android.graphics.BitmapFactory.Options) {
-                            o = (android.graphics.BitmapFactory.Options) a;
-                            break;
+            public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                if (cMomentsRaw) {
+                    try {
+                        Object[] args = chain.getArgs().toArray();
+                        android.graphics.BitmapFactory.Options o = null;
+                        for (Object a : args) {
+                            if (a instanceof android.graphics.BitmapFactory.Options) {
+                                o = (android.graphics.BitmapFactory.Options) a;
+                                break;
+                            }
                         }
+                        if (o != null && !o.inJustDecodeBounds) {
+                            // 精确判定「真的会缩小」：inSampleSize>1，或 density 缩放确实生效
+                            boolean densityScale = o.inScaled && o.inDensity > 0 && o.inTargetDensity > 0
+                                    && o.inDensity != o.inTargetDensity;
+                            if (o.inSampleSize > 1 || densityScale) {
+                                // ⚠ inSampleSize 很大（>4）说明微信要的是缩略图/预览图（实测预览阶段用 15，
+                                //   即 1/15 尺寸）。强行解成全尺寸会把 48MB 的 Bitmap 当缩略图用，直接 OOM。
+                                //   上传主图的降采样倍率很小，卡在 4 以内足够覆盖。
+                                if (o.inSampleSize > 4) return chain.proceed();
+                                if (!nearSns() || !inSnsStack()) return chain.proceed();
+                                if (sDecodeBlocked >= 16) return chain.proceed();
+                                sDecodeBlocked++;
+                                log("★ [朋友圈拦截] 解码降采样已取消 inSampleSize=" + o.inSampleSize
+                                        + " inScaled=" + o.inScaled + "  " + chain.getExecutable().getName()
+                                        + (sDecodeBlocked <= 3 ? "\n    栈: " + stackBrief() : ""));
+                                o.inSampleSize = 1;
+                                o.inScaled = false;
+                                o.inDensity = 0;
+                                o.inTargetDensity = 0;
+                            }
+                        }
+                    } catch (Throwable ignored) {
                     }
-                    if (o == null || o.inJustDecodeBounds) return;
-                    // 精确判定「真的会缩小」：inSampleSize>1，或 density 缩放确实生效
-                    boolean densityScale = o.inScaled && o.inDensity > 0 && o.inTargetDensity > 0
-                            && o.inDensity != o.inTargetDensity;
-                    if (o.inSampleSize <= 1 && !densityScale) return;
-                    // ⚠ inSampleSize 很大（>4）说明微信要的是缩略图/预览图（实测预览阶段用 15，
-                    //   即 1/15 尺寸）。强行解成全尺寸会把 48MB 的 Bitmap 当缩略图用，直接 OOM。
-                    //   上传主图的降采样倍率很小，卡在 4 以内足够覆盖。
-                    if (o.inSampleSize > 4) return;
-                    if (!nearSns() || !inSnsStack()) return;
-                    if (sDecodeBlocked >= 16) return;
-                    sDecodeBlocked++;
-                    log("★ [朋友圈拦截] 解码降采样已取消 inSampleSize=" + o.inSampleSize
-                            + " inScaled=" + o.inScaled + "  " + p.method.getName()
-                            + (sDecodeBlocked <= 3 ? "\n    栈: " + stackBrief() : ""));
-                    o.inSampleSize = 1;
-                    o.inScaled = false;
-                    o.inDensity = 0;
-                    o.inTargetDensity = 0;
-                } catch (Throwable ignored) {
                 }
+                return chain.proceed();
             }
         };
         try {
-            XposedHelpers.findAndHookMethod(android.graphics.BitmapFactory.class, "decodeFile",
-                    String.class, android.graphics.BitmapFactory.Options.class, decOpt);
-            XposedHelpers.findAndHookMethod(android.graphics.BitmapFactory.class, "decodeStream",
+            hook(findMethod(android.graphics.BitmapFactory.class, "decodeFile",
+                    String.class, android.graphics.BitmapFactory.Options.class)).intercept(decOpt);
+            hook(findMethod(android.graphics.BitmapFactory.class, "decodeStream",
                     java.io.InputStream.class, android.graphics.Rect.class,
-                    android.graphics.BitmapFactory.Options.class, decOpt);
-            XposedHelpers.findAndHookMethod(android.graphics.BitmapFactory.class, "decodeByteArray",
+                    android.graphics.BitmapFactory.Options.class)).intercept(decOpt);
+            hook(findMethod(android.graphics.BitmapFactory.class, "decodeByteArray",
                     byte[].class, int.class, int.class,
-                    android.graphics.BitmapFactory.Options.class, decOpt);
-            XposedHelpers.findAndHookMethod(android.graphics.BitmapFactory.class, "decodeFileDescriptor",
+                    android.graphics.BitmapFactory.Options.class)).intercept(decOpt);
+            hook(findMethod(android.graphics.BitmapFactory.class, "decodeFileDescriptor",
                     java.io.FileDescriptor.class, android.graphics.Rect.class,
-                    android.graphics.BitmapFactory.Options.class, decOpt);
+                    android.graphics.BitmapFactory.Options.class)).intercept(decOpt);
             log("已挂载 BitmapFactory 解码降采样拦截");
         } catch (Throwable t) {
             log("hook BitmapFactory options 失败: " + t);
@@ -1261,7 +1361,7 @@ public class MainHook implements IXposedHookLoadPackage {
             int n = 0;
             for (StackTraceElement e : st) {
                 String cn = e.getClassName();
-                if (cn.startsWith("java.lang.Thread") || cn.startsWith("de.robv.android.xposed")
+                if (cn.startsWith("java.lang.Thread") || cn.startsWith("io.github.libxposed")
                         || cn.startsWith("com.abel.wechatlive")) {
                     continue;
                 }
@@ -1329,7 +1429,6 @@ public class MainHook implements IXposedHookLoadPackage {
                 || name.matches("pre_temp_sns_live_photo_remux_[0-9a-fA-F]{32}");
     }
 
-    /** 把原图覆盖进朋友圈上传临时文件（复制法核心动作）。一次成功即停，避免反复写。 */
     /**
      * 用原图字节覆盖上传临时文件。
      * @return COPY_WRITTEN=实际写入 / COPY_SAME=本已是原图字节(无需写) / COPY_FAIL=跳过或失败
@@ -1475,33 +1574,38 @@ public class MainHook implements IXposedHookLoadPackage {
      * 开关关闭时零开销。
      */
     private void installPathCapture() {
-        XC_MethodHook cap = new XC_MethodHook() {
+        XposedInterface.Hooker cap = new XposedInterface.Hooker() {
             @Override
-            protected void beforeHookedMethod(MethodHookParam p) {
-                if (!cMomentsRaw) return;
-                try {
-                    String k = (String) p.args[0];
-                    if (k == null) return;
-                    String kl = k.toLowerCase(Locale.US);
-                    if (!(kl.contains("path") || kl.contains("media") || kl.contains("image")
-                            || kl.contains("sns") || kl.contains("select"))) return;
-                    Object v = p.args[1];
-                    if (v instanceof ArrayList) {
-                        for (Object o : (ArrayList<?>) v) if (o instanceof String) addSelected((String) o);
-                    } else if (v instanceof String[]) {
-                        for (String s : (String[]) v) if (s != null) addSelected(s);
-                    } else if (v instanceof String) {
-                        addSelected((String) v);
+            public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                if (cMomentsRaw) {
+                    try {
+                        Object[] args = chain.getArgs().toArray();
+                        String k = (String) args[0];
+                        if (k != null) {
+                            String kl = k.toLowerCase(Locale.US);
+                            if (kl.contains("path") || kl.contains("media") || kl.contains("image")
+                                    || kl.contains("sns") || kl.contains("select")) {
+                                Object v = args[1];
+                                if (v instanceof ArrayList) {
+                                    for (Object o : (ArrayList<?>) v) if (o instanceof String) addSelected((String) o);
+                                } else if (v instanceof String[]) {
+                                    for (String s : (String[]) v) if (s != null) addSelected(s);
+                                } else if (v instanceof String) {
+                                    addSelected((String) v);
+                                }
+                            }
+                        }
+                    } catch (Throwable ignored) {
                     }
-                } catch (Throwable ignored) {
                 }
+                return chain.proceed();
             }
         };
-        try { XposedHelpers.findAndHookMethod(Intent.class, "putExtra", String.class, ArrayList.class, cap); }
+        try { hook(findMethod(Intent.class, "putExtra", String.class, ArrayList.class)).intercept(cap); }
         catch (Throwable t) { log("hook putExtra(ArrayList) 失败: " + t); }
-        try { XposedHelpers.findAndHookMethod(Intent.class, "putExtra", String.class, String[].class, cap); }
+        try { hook(findMethod(Intent.class, "putExtra", String.class, String[].class)).intercept(cap); }
         catch (Throwable t) { log("hook putExtra(String[]) 失败: " + t); }
-        try { XposedHelpers.findAndHookMethod(Intent.class, "putExtra", String.class, String.class, cap); }
+        try { hook(findMethod(Intent.class, "putExtra", String.class, String.class)).intercept(cap); }
         catch (Throwable t) { log("hook putExtra(String) 失败: " + t); }
         log("已挂载相册选中原图路径捕获（朋友圈上传原图开启时生效）");
     }
@@ -1861,8 +1965,6 @@ public class MainHook implements IXposedHookLoadPackage {
         return false;
     }
 
-    // v8.5：relaxClip / rectOf 随「挪开按钮」方案一并移除（改为直接隐藏，无需算重叠矩形）。
-
     /** 隐藏容器前的安全阀名单：容器里出现这些文字，说明识别过宽，绝不能整块 GONE */
     private static final String[] KEY_BTN_TEXTS = {"完成", "预览", "发送", "制作视频"};
 
@@ -2022,7 +2124,7 @@ public class MainHook implements IXposedHookLoadPackage {
         });
     }
 
-    /** 取微信版本号（宿主上下文的包名即为 com.tencent.mm）。zygote 阶段不会调用本方法。 */
+    /** 取微信版本号（宿主上下文的包名即为 com.tencent.mm）。入口阶段不会调用本方法。 */
     private static String wxVersion(Context ctx) {
         if (sWxVer != null) return sWxVer;
         try {
@@ -2037,13 +2139,38 @@ public class MainHook implements IXposedHookLoadPackage {
 
     // ══════════════════════════ 工具 ══════════════════════════
 
+    /**
+     * 反射找方法。先找公共方法（含继承），找不到再找声明方法并放开访问。
+     * 注意：Bundle.putBoolean/getBoolean 定义在 BaseBundle，必须能查继承方法。
+     */
+    private static Method findMethod(Class<?> cls, String name, Class<?>... pts) {
+        try {
+            return cls.getMethod(name, pts);
+        } catch (NoSuchMethodException e) {
+            Method m = cls.getDeclaredMethod(name, pts);
+            m.setAccessible(true);
+            return m;
+        }
+    }
+
+    /** 反射找构造器（先公共后声明） */
+    private static Constructor<?> findCtor(Class<?> cls, Class<?>... pts) {
+        try {
+            return cls.getConstructor(pts);
+        } catch (NoSuchMethodException e) {
+            Constructor<?> c = cls.getDeclaredConstructor(pts);
+            c.setAccessible(true);
+            return c;
+        }
+    }
+
     private static Handler ui() {
         Handler h = sHandler;
         if (h != null) return h;
         synchronized (MainHook.class) {
             if (sHandler == null) {
                 Looper l = Looper.getMainLooper();
-                if (l == null) return null;   // zygote 阶段直接放弃，绝不抛异常
+                if (l == null) return null;   // 入口阶段直接放弃，绝不抛异常
                 sHandler = new Handler(l);
             }
             return sHandler;
@@ -2072,7 +2199,10 @@ public class MainHook implements IXposedHookLoadPackage {
         } catch (Throwable ignored) {
         }
         try {
-            XposedBridge.log("[" + TAG + "] " + line);
+            // v8.7：LibXposed 框架日志（LSPosed 管理器「日志」页可见）。
+            // 经入口实例桥接；入口未初始化（非微信进程）时静默跳过。
+            MainHook s = sSelf;
+            if (s != null) s.log(android.util.Log.INFO, TAG, line);
         } catch (Throwable ignored) {
         }
         synchronized (PENDING) {
