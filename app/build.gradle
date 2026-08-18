@@ -47,5 +47,6 @@ dependencies {
     //   1) 模块入口 extends XposedModule（不再 implements 旧版 IXposedHookLoadPackage）
     //   2) 模块内禁止调用旧版 Xposed API（de.robv.*）
     //   3) minSdk >= 27（Android 8.1+）
-    compileOnly 'io.github.libxposed:api:102'
+    // 注意版本号必须是完整的三段式 102.0.0（Central 没有省略式 102 这个版本）
+    compileOnly 'io.github.libxposed:api:102.0.0'
 }
