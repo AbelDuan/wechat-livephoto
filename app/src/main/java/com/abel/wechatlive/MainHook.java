@@ -213,7 +213,7 @@ public class MainHook extends XposedModule {
             sSelf = this;
             sProc = myProcName();
             log("========================================");
-            log("WechatLive v8.10 注入成功  proc=" + sProc);
+            log("WechatLive v8.11 注入成功  proc=" + sProc);
 
             // 相册只在主进程，重量级 hook 只装主进程，避免 :push/:appbrand 等无谓开销
             boolean main = Const.WECHAT_PKG.equals(sProc);
@@ -1662,8 +1662,11 @@ public class MainHook extends XposedModule {
             if (fromMomentsFlow()) {
                 hideMomentsRawButton(act);
             } else {
+                removeMomentsHideListener();   // 离开朋友圈流程：移除布局监听
                 restoreRawButtonLayout(act);
             }
+        } else {
+            removeMomentsHideListener();       // SnsUploadUI 发布界面：不再需要监听
         }
 
         // 相册 / 朋友圈发布界面：把实际生效的 extras 打出来
@@ -1848,56 +1851,92 @@ public class MainHook extends XposedModule {
      * 触摸区域与布局空间）。按钮隐藏与「朋友圈上传原图」开关无关（始终隐藏，避免重叠），
      * 而是否发原图由该开关统一控制——开启即强制 send_raw_img=true，关闭则随微信默认。
      */
+    /**
+     * v8.10→v8.11：消除「一闪而过」闪烁。
+     * 旧版在 onResume 后按固定延时（300/900/1800…ms）重试隐藏，但「原图」按钮是在
+     * 用户「勾选图片之后」才出现的，于是出现瞬间到首次隐藏之间留了一段可见窗口 → 闪一下。
+     * 现改为「布局监听」：按钮一进入视图树立即 GONE，并在每次布局变化时复查
+     * （微信可能重建/重显该按钮），从根上消除闪烁。监听在离开朋友圈流程 / Activity
+     * 销毁时移除（见 removeMomentsHideListener）。
+     */
+    private static android.view.ViewTreeObserver.OnGlobalLayoutListener sMomentsHideListener = null;
+    private static View sMomentsHideDecor = null;
+
     private static void hideMomentsRawButton(final Activity act) {
         final Handler h = ui();
         if (h == null) return;
         sLastHideSig = Integer.MIN_VALUE;   // 每次进相册重置，保证本次隐藏有一条日志可查
-        // 「原图」按钮常在勾选图片之后才出现，且微信可能重建/重显 → 多轮重试（幂等）
-        for (int delay : new int[]{300, 900, 1800, 3200, 5000}) {
-            scheduleHideRawButton(act, h, delay);
+
+        // 立即尝试一次（多数情况按钮已存在，直接无闪烁隐藏）
+        doHideMomentsRawButton(act);
+
+        // 布局监听：按钮出现/重建时立刻再隐藏，消除「一闪而过」
+        final View decor = act.getWindow().getDecorView();
+        removeMomentsHideListener();         // 防止重复注册
+        sMomentsHideDecor = decor;
+        sMomentsHideListener = new android.view.ViewTreeObserver.OnGlobalLayoutListener() {
+            @Override
+            public void onGlobalLayout() {
+                // Activity 已销毁或已离开朋友圈流程 → 自清理，避免对无关界面误隐藏
+                if (act.isFinishing() || act.isDestroyed() || !fromMomentsFlow()) {
+                    removeMomentsHideListener();
+                    return;
+                }
+                doHideMomentsRawButton(act);
+            }
+        };
+        android.view.ViewTreeObserver vto = decor.getViewTreeObserver();
+        if (vto.isAlive()) vto.addOnGlobalLayoutListener(sMomentsHideListener);
+    }
+
+    /** 移除朋友圈「原图」按钮的布局监听（离开流程 / Activity 销毁时调用） */
+    private static void removeMomentsHideListener() {
+        if (sMomentsHideListener != null && sMomentsHideDecor != null) {
+            try {
+                android.view.ViewTreeObserver vto = sMomentsHideDecor.getViewTreeObserver();
+                if (vto.isAlive()) vto.removeOnGlobalLayoutListener(sMomentsHideListener);
+            } catch (Throwable ignored) { }
+        }
+        sMomentsHideListener = null;
+        sMomentsHideDecor = null;
+    }
+
+    /** 实际执行一次隐藏：找到「原图」按钮并 GONE（幂等，含安全阀） */
+    private static void doHideMomentsRawButton(final Activity act) {
+        try {
+            View root = act.getWindow().getDecorView();
+            TextView yuanTv = findText(root, "原图");
+            if (yuanTv == null) return;                     // 还没出现（或已被隐藏）
+
+            View yuan = buttonContainerOf(yuanTv);          // 图标+文字的整体容器
+
+            // 安全阀：容器若混进了「完成/预览/发送/制作视频」等关键按钮，说明识别过宽，
+            // 直接 GONE 会让用户发不出去 → 退化为只隐藏「原图」文字与它同级的圆圈图标。
+            boolean tooWide = containsAnyText(yuan, KEY_BTN_TEXTS);
+            if (tooWide) yuan = yuanTv;
+
+            // 清掉历史版本可能残留的位移，避免隐藏后再显示时布局是歪的
+            yuanTv.setTranslationX(0); yuanTv.setTranslationY(0);
+            yuan.setTranslationX(0);   yuan.setTranslationY(0);
+
+            boolean changed = yuan.getVisibility() != View.GONE;
+            yuan.setVisibility(View.GONE);
+            yuanTv.setVisibility(View.GONE);
+            if (tooWide) setSiblingIconsVisibility(yuanTv, View.GONE);  // 圆圈也要藏
+
+            if (changed && sLastHideSig != 1) {
+                sLastHideSig = 1;
+                log("★ [UI] 朋友圈流程：已隐藏「原图」按钮"
+                        + (tooWide ? "（安全模式：仅文字+图标）" : "")
+                        + "；是否发原图由模块「朋友圈上传原图」开关统一控制");
+            }
+        } catch (Throwable t) {
+            log("UI 隐藏原图按钮失败: " + t);
         }
     }
 
     /** 上次隐藏结果签名，用于多轮重试时去重日志 */
     private static int sLastHideSig = Integer.MIN_VALUE;
-
-    private static void scheduleHideRawButton(final Activity act, Handler h, final int delay) {
-        h.postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                try {
-                    View root = act.getWindow().getDecorView();
-                    TextView yuanTv = findText(root, "原图");
-                    if (yuanTv == null) return;                     // 还没出现（或已被隐藏）
-
-                    View yuan = buttonContainerOf(yuanTv);          // 图标+文字的整体容器
-
-                    // 安全阀：容器若混进了「完成/预览/发送/制作视频」等关键按钮，说明识别过宽，
-                    // 直接 GONE 会让用户发不出去 → 退化为只隐藏「原图」文字与它同级的圆圈图标。
-                    boolean tooWide = containsAnyText(yuan, KEY_BTN_TEXTS);
-                    if (tooWide) yuan = yuanTv;
-
-                    // 清掉历史版本可能残留的位移，避免隐藏后再显示时布局是歪的
-                    yuanTv.setTranslationX(0); yuanTv.setTranslationY(0);
-                    yuan.setTranslationX(0);   yuan.setTranslationY(0);
-
-                    boolean changed = yuan.getVisibility() != View.GONE;
-                    yuan.setVisibility(View.GONE);
-                    yuanTv.setVisibility(View.GONE);
-                    if (tooWide) setSiblingIconsVisibility(yuanTv, View.GONE);  // 圆圈也要藏
-
-                    if (changed && sLastHideSig != 1) {
-                        sLastHideSig = 1;
-                        log("★ [UI] 朋友圈流程：已隐藏「原图」按钮"
-                                + (tooWide ? "（安全模式：仅文字+图标）" : "")
-                                + "；是否发原图由模块「朋友圈上传原图」开关统一控制");
-                    }
-                } catch (Throwable t) {
-                    log("UI 隐藏原图按钮失败: " + t);
-                }
-            }
-        }, delay);
-    }
 
     /**
      * 聊天等非朋友圈流程：把可能残留的位移 / 隐藏全部复位，让「原图」按钮回到微信默认外观。

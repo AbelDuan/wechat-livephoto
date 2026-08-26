@@ -7,8 +7,8 @@ android {
         // LibXposed API 100+ 要求 Android 8.1+（原为 24/Android 7.0）
         minSdkVersion 27
         targetSdkVersion 28
-        versionCode 28
-        versionName "8.10"
+        versionCode 29
+        versionName "8.11"
         // 必须单 dex：见 gradle.properties 说明
         multiDexEnabled false
     }
