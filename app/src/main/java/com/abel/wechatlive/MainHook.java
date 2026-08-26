@@ -213,7 +213,7 @@ public class MainHook extends XposedModule {
             sSelf = this;
             sProc = myProcName();
             log("========================================");
-            log("WechatLive v8.9 注入成功  proc=" + sProc);
+            log("WechatLive v8.10 注入成功  proc=" + sProc);
 
             // 相册只在主进程，重量级 hook 只装主进程，避免 :push/:appbrand 等无谓开销
             boolean main = Const.WECHAT_PKG.equals(sProc);
@@ -1653,11 +1653,13 @@ public class MainHook extends XposedModule {
         if (!gallery) return;     // 非相册界面：仅心跳，不做 extras 验证
 
         // 微信相册选择界面（非 SnsUploadUI 发布界面）。
-        // v8.5：朋友圈流程不再尝试挪动「原图」按钮（它与照片/制作视频重叠且挡住点击），
-        //       改为直接隐藏；发不发原图完全由模块强制注入 send_raw_img=true 决定。
-        //       聊天流程保持微信默认外观（并复位可能残留的隐藏/位移）。
+        // v8.10：朋友圈流程「始终」隐藏「原图」按钮——它与照片/「制作视频」抢同一贴底区域、
+        //        重叠并吃掉点击。隐藏与「朋友圈上传原图」开关**解耦**：无论开关开否都隐藏，
+        //        按钮只作为冗余 UI 被移除；实际是否发原图完全由模块「朋友圈上传原图」
+        //        开关统一控制（开启→强制 send_raw_img=true，关闭→随微信默认）。
+        //        聊天流程保持微信默认外观（并复位可能残留的隐藏/位移）。
         if (!moments) {
-            if (cMomentsRaw && fromMomentsFlow()) {
+            if (fromMomentsFlow()) {
                 hideMomentsRawButton(act);
             } else {
                 restoreRawButtonLayout(act);
@@ -1843,8 +1845,8 @@ public class MainHook extends XposedModule {
      *  - 用户实测：重叠区域会吃掉触摸事件，导致按钮本身和下面的照片都点不中。
      *
      * 现在：把整个按钮容器 setVisibility(GONE)（GONE 而非 INVISIBLE，才会真正让出
-     * 触摸区域与布局空间）。是否发原图不再依赖这个 UI 开关，而是由模块强制注入
-     * send_raw_img=true 决定——即"由 APK 里的「朋友圈上传原图」开关统一控制"。
+     * 触摸区域与布局空间）。按钮隐藏与「朋友圈上传原图」开关无关（始终隐藏，避免重叠），
+     * 而是否发原图由该开关统一控制——开启即强制 send_raw_img=true，关闭则随微信默认。
      */
     private static void hideMomentsRawButton(final Activity act) {
         final Handler h = ui();
@@ -1888,7 +1890,7 @@ public class MainHook extends XposedModule {
                         sLastHideSig = 1;
                         log("★ [UI] 朋友圈流程：已隐藏「原图」按钮"
                                 + (tooWide ? "（安全模式：仅文字+图标）" : "")
-                                + "；是否发原图由模块强制 send_raw_img=true 决定");
+                                + "；是否发原图由模块「朋友圈上传原图」开关统一控制");
                     }
                 } catch (Throwable t) {
                     log("UI 隐藏原图按钮失败: " + t);
