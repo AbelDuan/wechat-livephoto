@@ -36,8 +36,6 @@ public final class Const {
     public static final String K_VERBOSE = "verbose";
     /** 用户开关：日志记录（写入 App 私有文件，排障/导出用，默认关闭省电） */
     public static final String K_LOG = "enable_log";
-    /** 用户开关：朋友圈上传原图（默认关闭；开启后朋友圈发布界面会强制原图键，可能与「制作视频」按钮重叠） */
-    public static final String K_MOMENTS_RAW = "moments_raw";
 
     /** 状态：最近一次微信侧回报的时间戳 */
     public static final String K_LAST_SEEN = "last_seen";

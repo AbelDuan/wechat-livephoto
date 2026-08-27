@@ -218,7 +218,7 @@ public class MainHook extends XposedModule {
             sSelf = this;
             sProc = myProcName();
             log("========================================");
-            log("WechatLive v8.13 注入成功  proc=" + sProc);
+            log("WechatLive v8.14 注入成功  proc=" + sProc);
 
             // 相册只在主进程，重量级 hook 只装主进程，避免 :push/:appbrand 等无谓开销
             boolean main = Const.WECHAT_PKG.equals(sProc);
@@ -229,11 +229,6 @@ public class MainHook extends XposedModule {
 
             installExtraForcing();
             installLifecycle();
-            installCompressProbe();
-            installMomentsProbe();
-            installPathCapture();
-            installMomentsCopy();   // v7.7：复制法（用原图替换朋友圈上传临时文件，绕过压缩）
-            installMomentsScaleProbe(); // v7.8：朋友圈缩放探测
         } catch (Throwable t) {
             log("onPackageReady 异常: " + t);
         }
@@ -274,16 +269,6 @@ public class MainHook extends XposedModule {
                 if (sChatRawOptOut) return null;
                 return Boolean.TRUE;   // 未取消：维持「默认开启原图」
             }
-        }
-        // 朋友圈上传原图：单独开关控制。开启后在「相册选择界面」(构建启动 SnsUploadUI 的
-        // Intent 时)与 SnsUploadUI 自身都强制原图键，确保键真实存在(containsKey 通过)，
-        // 而非仅在读取侧覆盖值——实测 SnsUploadUI 的 Intent 不含该键会导致强制失效。
-        // v8.6：加 fromMomentsFlow() 限定。旧版只写 looksLikeGallery()，而它匹配
-        //       gallery/album/imagepreview → 聊天相册与图片预览界面全被命中，
-        //       于是聊天流程被这条二次强制，是"取消原图无效"的另一半根因。
-        if (cMomentsRaw && (moments || (looksLikeGallery(sCurrentActivity) && fromMomentsFlow()))) {
-            if (K_SEND_RAW.equals(key)) return Boolean.TRUE;
-            if (K_SHOW_RAW_BTN.equals(key)) return Boolean.TRUE;
         }
         return null;
     }
@@ -440,31 +425,7 @@ public class MainHook extends XposedModule {
                             if (sAppCtx == null) {
                                 sAppCtx = ((Activity) thiz).getApplicationContext();
                             }
-                            // v7.8：朋友圈发布界面直接把原图键注入 Intent，保证键真实存在。
-                            // 读取侧覆盖值(旧方案)在 SnsUploadUI 的 Intent 不含该键时无效
-                            // （微信可能靠 containsKey 判断），这里在 WeChat 读取前写入 Bundle。
-                            if (isMomentsPublisher(sCurrentActivity)) {
-                                // 冷启动竞态兜底：cMomentsRaw 原本只在 onResume 经后台线程异步
-                                // cr.call 拉取；微信冷启动后模块立即注入、但模块 App 的 ContentProvider
-                                // 尚未就绪时，前几次 cr.call 返回 null → cMomentsRaw 停在默认 false，
-                                // 导致「第一次进朋友圈」漏注入 send_raw_img（用户感知发的不是原图）。
-                                // 此处进入发布界面时主动同步补拉一次开关，确保本次不漏。
-                                if (!cMomentsRaw) {
-                                    syncPullSwitches(((Activity) thiz).getApplicationContext());
-                                }
-                                if (cMomentsRaw) {
-                                    Intent it = ((Activity) thiz).getIntent();
-                                    if (it != null) {
-                                        it.putExtra(K_SEND_RAW, true);
-                                        it.putExtra(K_SHOW_RAW_BTN, true);
-                                        log("★ [朋友圈注入] SnsUploadUI Intent 已注入 send_raw_img=true");
-                                    }
-                                    // v7.9：此刻微信的图像 native 库已加载，采集一次用于定位编码器
-                                    dumpImageNativeLibs();
-                                } else {
-                                    log("★ [朋友圈注入] 跳过：cMomentsRaw=false（开关未就绪，模块 App 可能未启动）");
-                                }
-                            }
+                            // v8.14：朋友圈原图功能已移除，此处不再注入/探测。
                         } catch (Throwable ignored) {
                         }
                     }
@@ -1751,34 +1712,8 @@ public class MainHook extends XposedModule {
         //        按钮只作为冗余 UI 被移除；实际是否发原图完全由模块「朋友圈上传原图」
         //        开关统一控制（开启→强制 send_raw_img=true，关闭→随微信默认）。
         //        聊天流程保持微信默认外观（并复位可能残留的隐藏/位移）。
-        if (!moments) {
-            if (fromMomentsFlow()) {
-                hideMomentsRawButton(act);
-            } else {
-                removeMomentsHideListener();   // 离开朋友圈流程：移除布局监听
-                restoreRawButtonLayout(act);
-            }
-        } else {
-            removeMomentsHideListener();       // SnsUploadUI 发布界面：不再需要监听
-        }
-
         // 相册 / 朋友圈发布界面：把实际生效的 extras 打出来
         dumpIntentExtras(act, moments);
-
-        if (moments) {
-            log("★ 朋友圈发布界面：已抓取该界面全部 Intent extras（见上方）。");
-            log("  诊断已落盘——请在本界面停留约 1 秒，再回 App「导出日志」即可拿到完整抓取。");
-            StringBuilder ps = new StringBuilder("★ 本次会话已捕获原图路径(Intent=" + sSelectedPaths.size()
-                    + "  FileInputStream探针=" + (sLastOriginalPath != null ? 1 : 0) + "):");
-            synchronized (sSelectedPaths) {
-                for (String s : sSelectedPaths) ps.append("\n    [Intent] ").append(s);
-            }
-            if (sLastOriginalPath != null) ps.append("\n    [FileInputStream] ").append(sLastOriginalPath);
-            ps.append("\n  ★ 注入统计：原图直塞=" + sRawInjected
-                    + "  质量拉满=" + sQualityBoost + "  复制法覆盖=" + sCopyInjected
-                    + "  原图确认=" + sRawSame);
-            log(ps.toString());
-        }
 
         if (!cVerbose) {
             // 即使不抓 View 树，也确保上面的 extras 诊断已被写入 App 文件
@@ -2249,7 +2184,6 @@ public class MainHook extends XposedModule {
                         cOrig = out.getBoolean(Const.K_ORIG, true);
                         // v8.9：详细日志开关已移除，cVerbose 恒为 false，不再从 App 读取
                         cLog = out.getBoolean(Const.K_LOG, false);
-                        cMomentsRaw = out.getBoolean(Const.K_MOMENTS_RAW, false);
                     }
                 } catch (Throwable t) {
                     // 模块 App 被冻结/未安装时会走到这里，忽略即可
@@ -2271,33 +2205,7 @@ public class MainHook extends XposedModule {
         return sWxVer;
     }
 
-    /**
-     * 同步拉取开关（关键时刻兜底，绕过 onResume 的限流与后台线程异步）。
-     * 根因：开关原本只在 onResume 经后台线程异步 cr.call 拉取；微信冷启动后模块立即注入，
-     * 但模块 App 的 ContentProvider 尚未就绪，前几次 cr.call 返回 null → cMomentsRaw 停在默认
-     * false，导致冷启动后第一次进朋友圈 SnsUploadUI 时漏注入 send_raw_img（发的不是原图）。
-     * 在 SnsUploadUI.onCreate 等关键时刻同步补拉一次，确保开关已就位。
-     * 仅在必要时调用（当前 cMomentsRaw 为 false 且确属朋友圈界面），避免主线程频繁 IPC。
-     */
-    private static void syncPullSwitches(Context ctx) {
-        if (ctx == null) return;
-        try {
-            ContentResolver cr = ctx.getContentResolver();
-            Bundle in = new Bundle();
-            in.putString(Const.K_LAST_ACT, sCurrentActivity);
-            in.putString(Const.K_WX_VER, wxVersion(ctx));
-            in.putString("proc", sProc);
-            Bundle out = cr.call(Uri.parse(Const.URI), Const.METHOD_REPORT, null, in);
-            if (out != null) {
-                cEnabled = out.getBoolean(Const.K_ENABLED, true);
-                cLive = out.getBoolean(Const.K_LIVE, true);
-                cOrig = out.getBoolean(Const.K_ORIG, true);
-                cLog = out.getBoolean(Const.K_LOG, false);
-                cMomentsRaw = out.getBoolean(Const.K_MOMENTS_RAW, false);
-            }
-        } catch (Throwable ignored) {
-        }
-    }
+    // v8.14：朋友圈原图开关同步补拉已随该功能移除。
 
     // ══════════════════════════ 工具 ══════════════════════════
 
