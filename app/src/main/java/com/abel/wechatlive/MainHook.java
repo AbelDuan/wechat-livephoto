@@ -161,7 +161,7 @@ public class MainHook extends XposedModule {
             sSelf = this;
             sProc = myProcName();
             log("========================================");
-            log("WechatLive v8.17 注入成功  proc=" + sProc);
+            log("WechatLive v8.18 注入成功  proc=" + sProc);
 
             // 相册只在主进程，重量级 hook 只装主进程，避免 :push/:appbrand 等无谓开销
             boolean main = Const.WECHAT_PKG.equals(sProc);
@@ -200,6 +200,7 @@ public class MainHook extends XposedModule {
             if (K_LIVE_AUTO.equals(key)) return Boolean.TRUE;
             if (K_LIVE_QUERY.equals(key)) return Boolean.TRUE;
         }
+        if (!cLive && !cOrig) return null;   // A: 原图/实况强制都关 → 直接放行，跳过字符串扫描
         boolean moments = isMomentsPublisher(sCurrentActivity);
         if (cOrig && !moments) {
             // 「原图」按钮本身始终允许显示 —— 聊天流程要让用户能自己点。
@@ -440,9 +441,9 @@ public class MainHook extends XposedModule {
         if (act == null) return;
         final String cls = act.getClass().getName();
         sCurrentActivity = cls;   // 记录前台 Activity（供上下文感知强制使用）
-        log("onResume [" + sProc + "] " + cls);
 
         if (!cEnabled) return;
+        log("onResume [" + sProc + "] " + cls);
         boolean gallery = looksLikeGallery(cls);
         // v8.4：相册界面(AlbumPreviewUI)聊天与朋友圈共用，类名分不出来。
         //      记住进入相册「之前」停留的界面，用它判断本次选图属于哪条流程。
