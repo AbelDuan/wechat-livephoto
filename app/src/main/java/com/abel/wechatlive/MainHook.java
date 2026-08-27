@@ -148,6 +148,11 @@ public class MainHook extends XposedModule {
     //       v8.2 把这两种情况都算成「注入成功」，导致统计虚高、误判。
     private static volatile int sRawSame = 0;
     private static final int COPY_FAIL = 0, COPY_SAME = 1, COPY_WRITTEN = 2;
+    // v8.12 诊断：朋友圈上下文里把所有 FileOutputStream/RandomAccessFile 真实路径打出来
+    // （不受 cVerbose 限制，cVerbose 在 v8.9 已永久 false），用于定位微信 8.0.77 是否改了
+    // 上传临时文件命名/写入方式（复制法 isImageTemp 失配的根因）。限次避免刷屏。
+    private static volatile int sDiagFos = 0;
+    private static volatile int sDiagRaf = 0;
     // v8.3 产物核验：微信可能在流关闭「之后」再次重编码上传文件，延迟回查并纠正
     private static final Set<String> sDraftDirs = new HashSet<String>();
     private static volatile long sSweepAt = 0L;        // 上次安排核验的时间，去重
@@ -213,7 +218,7 @@ public class MainHook extends XposedModule {
             sSelf = this;
             sProc = myProcName();
             log("========================================");
-            log("WechatLive v8.12 注入成功  proc=" + sProc);
+            log("WechatLive v8.13 注入成功  proc=" + sProc);
 
             // 相册只在主进程，重量级 hook 只装主进程，避免 :push/:appbrand 等无谓开销
             boolean main = Const.WECHAT_PKG.equals(sProc);
@@ -776,6 +781,51 @@ public class MainHook extends XposedModule {
         return matchInQuiet(scanPhotoDirs(), w, h);
     }
 
+    /**
+     * v8.13 复制法兜底：微信 8.0.77 可能把 pre_temp_sns_photo 临时文件做「降采样」压缩
+     * （临时尺寸 < 原图），此时 findOriginalForDims 的精确/±4px 匹配全部落空。
+     * 这里按「原图尺寸 ≥ 临时尺寸（两轴都包含）」找最小面积的那张——即降采样前的源图。
+     * 单图场景必然命中；多图同尺寸时选最接近的一张（比盲目放弃更优）。
+     */
+    private static String findOriginalContain(int tw, int th) {
+        List<String> cands;
+        synchronized (sPhotoCandidates) { cands = new ArrayList<String>(sPhotoCandidates); }
+        String best = null;
+        long bestArea = Long.MAX_VALUE;
+        for (String path : cands) {
+            try {
+                File f = new File(path);
+                if (!f.isFile()) continue;
+                long len = f.length();
+                if (len < 300 * 1024L || len > 40 * 1024 * 1024L) continue;
+                int[] wh = boundsOf(path);
+                if (wh == null) continue;
+                if (wh[0] >= tw && wh[1] >= th) {            // 原图两轴都 >= 临时（降采样）
+                    long area = (long) wh[0] * wh[1];
+                    if (area < bestArea) { bestArea = area; best = path; }
+                }
+            } catch (Throwable ignored) { }
+        }
+        if (best == null) {
+            // 候选池没命中再扫目录
+            for (String path : scanPhotoDirs()) {
+                try {
+                    File f = new File(path);
+                    if (!f.isFile()) continue;
+                    long len = f.length();
+                    if (len < 300 * 1024L || len > 40 * 1024 * 1024L) continue;
+                    int[] wh = boundsOf(path);
+                    if (wh == null) continue;
+                    if (wh[0] >= tw && wh[1] >= th) {
+                        long area = (long) wh[0] * wh[1];
+                        if (area < bestArea) { bestArea = area; best = path; }
+                    }
+                } catch (Throwable ignored) { }
+            }
+        }
+        return best;
+    }
+
     /** 原图 EXIF 是否标记了 90/270 度旋转（此时解码转正后宽高会互换） */
     private static boolean isRotated90(String path) {
         boolean prev = sInjecting;
@@ -958,6 +1008,12 @@ public class MainHook extends XposedModule {
                     String path = a0 instanceof File ? ((File) a0).getAbsolutePath()
                             : (a0 instanceof String ? (String) a0 : null);
                     if (path == null || !isMomentsFile(path)) return result;
+                    // v8.12 诊断：打印朋友圈上下文里每一个文件写出路径（不受 cVerbose 限制），
+                    // 用于看清微信 8.0.77 真实的上传临时文件名/写入方式（复制法 isImageTemp 失配根因）。
+                    if (sDiagFos < 50) {
+                        sDiagFos++;
+                        log("★ [诊断-FOS] " + shortPath(path) + "  imageTemp=" + isImageTemp(path));
+                    }
                     // 记录「图片类临时文件」(base / _parse / _remux_thumb，排除纯视频 remux)，
                     // 供复制法在流关闭后把原图覆盖进去。
                     Object thiz = chain.getThisObject();
@@ -999,6 +1055,11 @@ public class MainHook extends XposedModule {
                     String path = a0 instanceof File ? ((File) a0).getAbsolutePath()
                             : (a0 instanceof String ? (String) a0 : null);
                     if (path == null || !isMomentsFile(path)) return result;
+                    // v8.12 诊断：RAF 写出路径同样打印（微信可能改用 RandomAccessFile 写上传临时文件）。
+                    if (sDiagRaf < 30) {
+                        sDiagRaf++;
+                        log("★ [诊断-RAF] " + shortPath(path));
+                    }
                     if (!cVerbose) return result;      // v8.1：RAF 探测纯诊断，默认不打
                     if (seen.contains(path)) return result;
                     seen.add(path);
@@ -1118,6 +1179,17 @@ public class MainHook extends XposedModule {
                             return result;
                         }
                         String orig = findOriginalForDims(twh[0], twh[1]);
+                        if (orig == null) orig = findOriginalContain(twh[0], twh[1]);   // v8.13 降采样兜底
+                        if (orig == null) {                                             // v8.13 单图直达：候选唯一就直接用它
+                            synchronized (sPhotoCandidates) {
+                                if (sPhotoCandidates.size() == 1) {
+                                    orig = sPhotoCandidates.get(0);
+                                    if (sCopyLogged < 6) { sCopyLogged++;
+                                        log("★ [复制法决策] 单候选直达 " + shortPath(orig));
+                                    }
+                                }
+                            }
+                        }
                         if (orig != null) {
                             int r = overwriteTempWithOriginal(temp, orig);
                             if (r == COPY_WRITTEN) {
@@ -1427,11 +1499,20 @@ public class MainHook extends XposedModule {
     private static boolean isImageTemp(String path) {
         if (path == null) return false;
         String name = new File(path).getName();
-        String pre = "pre_temp_sns_live_photo";
-        if (!name.startsWith(pre)) return false;
-        // 基础上传文件：pre_temp_sns_live_photo<hash>（hash 直接接在后面，无额外下划线段）。
+        // v8.13：微信 8.0.77 把基础上传临时文件名由 pre_temp_sns_live_photo<hash>
+        //         改成了 pre_temp_sns_photo<hash>（去掉了 live_），两种前缀都要认。
+        String base;
+        if (name.startsWith("pre_temp_sns_live_photo")) {
+            base = "pre_temp_sns_live_photo";
+        } else if (name.startsWith("pre_temp_sns_photo")) {
+            base = "pre_temp_sns_photo";
+        } else {
+            return false;
+        }
+        // 基础上传文件：<prefix><hash>（hash 直接接在后面，无额外下划线段）。
         // _parse / _remux / _thumb 都是派生文件，绝不塞原图。
-        return name.indexOf('_', pre.length()) < 0;
+        String suffix = name.substring(base.length());
+        return suffix.indexOf('_') < 0;
     }
 
     /** 是否纯视频 remux（实况视频流）或缩略图，复制法必须跳过 */
@@ -1439,7 +1520,7 @@ public class MainHook extends XposedModule {
         if (path == null) return false;
         String name = new File(path).getName();
         return name.contains("_thumb")
-                || name.matches("pre_temp_sns_live_photo_remux_[0-9a-fA-F]{32}");
+                || name.matches("pre_temp_sns_(live_)?photo_remux_[0-9a-fA-F]{32}");
     }
 
     /**
