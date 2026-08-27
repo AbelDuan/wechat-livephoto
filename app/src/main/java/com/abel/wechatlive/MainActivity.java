@@ -151,9 +151,9 @@ public class MainActivity extends Activity {
         cbEnabled = addCheck(box, Const.K_ENABLED, true,
                 "启用模块");
         cbLive = addCheck(box, Const.K_LIVE, true,
-                "默认开启「实况」");
+                "开启「实况」");
         cbOrig = addCheck(box, Const.K_ORIG, true,
-                "默认开启「原图」");
+                "开启「原图」");
         cbLog = addCheck(box, Const.K_LOG, false,
                 "日志记录");
 
