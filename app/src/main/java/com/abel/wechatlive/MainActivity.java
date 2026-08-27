@@ -159,7 +159,67 @@ public class MainActivity extends Activity {
 
         topInner.addView(box, mw());
 
-        // 按钮
+        // 微信进程（功能开关下第一个功能块）
+        TextView wxHead = new TextView(this);
+        wxHead.setText("微信进程");
+        wxHead.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        wxHead.setTypeface(Typeface.DEFAULT_BOLD);
+        wxHead.setTextColor(Color.parseColor("#222222"));
+        wxHead.setPadding(dp(4), dp(10), dp(4), dp(2));
+        topInner.addView(wxHead, mw());
+
+        LinearLayout wxBar = new LinearLayout(this);
+        wxBar.setOrientation(LinearLayout.HORIZONTAL);
+        wxBar.setPadding(0, dp(6), 0, dp(6));
+        wxBar.addView(btn("强制停止微信", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                forceStopWeChat();
+            }
+        }), eq());
+        wxBar.addView(btn("启动微信", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                startWeChat();
+            }
+        }), eq());
+        topInner.addView(wxBar, mw());
+
+        // 桌面图标（可隐藏，隐藏后用拨号暗码找回；功能开关下第二个功能块）
+        TextView iconHead = new TextView(this);
+        iconHead.setText("桌面图标");
+        iconHead.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        iconHead.setTypeface(Typeface.DEFAULT_BOLD);
+        iconHead.setTextColor(Color.parseColor("#222222"));
+        iconHead.setPadding(dp(4), dp(10), dp(4), dp(2));
+        topInner.addView(iconHead, mw());
+
+        LinearLayout iconBox = new LinearLayout(this);
+        iconBox.setOrientation(LinearLayout.VERTICAL);
+        iconBox.setBackgroundColor(Color.WHITE);
+        iconBox.setPadding(dp(10), dp(6), dp(10), dp(6));
+
+        iconBtn = btn("隐藏桌面图标", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                toggleIcon();
+            }
+        });
+        iconBtn.setPadding(dp(8), dp(10), dp(8), dp(10));
+        iconBox.addView(iconBtn, mw());
+
+        TextView iconHint = new TextView(this);
+        iconHint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        iconHint.setTextColor(Color.parseColor("#888888"));
+        iconHint.setPadding(dp(2), dp(6), dp(2), dp(2));
+        iconHint.setText("隐藏后桌面不再显示本应用。找回方式：\n"
+                + "① 拨号盘输入 *#*#" + Const.SECRET_CODE + "#*#* 自动重新打开；\n"
+                + "② 或 adb：am start -n " + Const.MODULE_PKG + "/.MainActivity");
+        iconBox.addView(iconHint, mw());
+
+        topInner.addView(iconBox, mw());
+
+        // 操作按钮（功能开关下第三个功能块：刷新 / 复制日志 / 清空日志）
         LinearLayout bar = new LinearLayout(this);
         bar.setOrientation(LinearLayout.HORIZONTAL);
         bar.setPadding(0, dp(10), 0, dp(6));
@@ -195,66 +255,6 @@ public class MainActivity extends Activity {
         });
         exportBtn.setPadding(dp(8), dp(10), dp(8), dp(10));
         topInner.addView(exportBtn, mw());
-
-        // 微信进程（功能开关下第一排）
-        TextView wxHead = new TextView(this);
-        wxHead.setText("微信进程");
-        wxHead.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        wxHead.setTypeface(Typeface.DEFAULT_BOLD);
-        wxHead.setTextColor(Color.parseColor("#222222"));
-        wxHead.setPadding(dp(4), dp(10), dp(4), dp(2));
-        topInner.addView(wxHead, mw());
-
-        LinearLayout wxBar = new LinearLayout(this);
-        wxBar.setOrientation(LinearLayout.HORIZONTAL);
-        wxBar.setPadding(0, dp(6), 0, dp(6));
-        wxBar.addView(btn("强制停止微信", new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                forceStopWeChat();
-            }
-        }), eq());
-        wxBar.addView(btn("启动微信", new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                startWeChat();
-            }
-        }), eq());
-        topInner.addView(wxBar, mw());
-
-        // 桌面图标（可隐藏，隐藏后用拨号暗码找回；功能开关下第二排）
-        TextView iconHead = new TextView(this);
-        iconHead.setText("桌面图标");
-        iconHead.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        iconHead.setTypeface(Typeface.DEFAULT_BOLD);
-        iconHead.setTextColor(Color.parseColor("#222222"));
-        iconHead.setPadding(dp(4), dp(10), dp(4), dp(2));
-        topInner.addView(iconHead, mw());
-
-        LinearLayout iconBox = new LinearLayout(this);
-        iconBox.setOrientation(LinearLayout.VERTICAL);
-        iconBox.setBackgroundColor(Color.WHITE);
-        iconBox.setPadding(dp(10), dp(6), dp(10), dp(6));
-
-        iconBtn = btn("隐藏桌面图标", new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                toggleIcon();
-            }
-        });
-        iconBtn.setPadding(dp(8), dp(10), dp(8), dp(10));
-        iconBox.addView(iconBtn, mw());
-
-        TextView iconHint = new TextView(this);
-        iconHint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
-        iconHint.setTextColor(Color.parseColor("#888888"));
-        iconHint.setPadding(dp(2), dp(6), dp(2), dp(2));
-        iconHint.setText("隐藏后桌面不再显示本应用。找回方式：\n"
-                + "① 拨号盘输入 *#*#" + Const.SECRET_CODE + "#*#* 自动重新打开；\n"
-                + "② 或 adb：am start -n " + Const.MODULE_PKG + "/.MainActivity");
-        iconBox.addView(iconHint, mw());
-
-        topInner.addView(iconBox, mw());
 
         // 上方控制区占满剩余空间（weight=1），内容超高时自行滚动
         root.addView(top, new LinearLayout.LayoutParams(
