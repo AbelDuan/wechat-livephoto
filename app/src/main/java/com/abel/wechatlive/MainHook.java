@@ -213,7 +213,7 @@ public class MainHook extends XposedModule {
             sSelf = this;
             sProc = myProcName();
             log("========================================");
-            log("WechatLive v8.11 注入成功  proc=" + sProc);
+            log("WechatLive v8.12 注入成功  proc=" + sProc);
 
             // 相册只在主进程，重量级 hook 只装主进程，避免 :push/:appbrand 等无谓开销
             boolean main = Const.WECHAT_PKG.equals(sProc);
@@ -438,15 +438,27 @@ public class MainHook extends XposedModule {
                             // v7.8：朋友圈发布界面直接把原图键注入 Intent，保证键真实存在。
                             // 读取侧覆盖值(旧方案)在 SnsUploadUI 的 Intent 不含该键时无效
                             // （微信可能靠 containsKey 判断），这里在 WeChat 读取前写入 Bundle。
-                            if (cMomentsRaw && isMomentsPublisher(sCurrentActivity)) {
-                                Intent it = ((Activity) thiz).getIntent();
-                                if (it != null) {
-                                    it.putExtra(K_SEND_RAW, true);
-                                    it.putExtra(K_SHOW_RAW_BTN, true);
-                                    log("★ [朋友圈注入] SnsUploadUI Intent 已注入 send_raw_img=true");
+                            if (isMomentsPublisher(sCurrentActivity)) {
+                                // 冷启动竞态兜底：cMomentsRaw 原本只在 onResume 经后台线程异步
+                                // cr.call 拉取；微信冷启动后模块立即注入、但模块 App 的 ContentProvider
+                                // 尚未就绪时，前几次 cr.call 返回 null → cMomentsRaw 停在默认 false，
+                                // 导致「第一次进朋友圈」漏注入 send_raw_img（用户感知发的不是原图）。
+                                // 此处进入发布界面时主动同步补拉一次开关，确保本次不漏。
+                                if (!cMomentsRaw) {
+                                    syncPullSwitches(((Activity) thiz).getApplicationContext());
                                 }
-                                // v7.9：此刻微信的图像 native 库已加载，采集一次用于定位编码器
-                                dumpImageNativeLibs();
+                                if (cMomentsRaw) {
+                                    Intent it = ((Activity) thiz).getIntent();
+                                    if (it != null) {
+                                        it.putExtra(K_SEND_RAW, true);
+                                        it.putExtra(K_SHOW_RAW_BTN, true);
+                                        log("★ [朋友圈注入] SnsUploadUI Intent 已注入 send_raw_img=true");
+                                    }
+                                    // v7.9：此刻微信的图像 native 库已加载，采集一次用于定位编码器
+                                    dumpImageNativeLibs();
+                                } else {
+                                    log("★ [朋友圈注入] 跳过：cMomentsRaw=false（开关未就绪，模块 App 可能未启动）");
+                                }
                             }
                         } catch (Throwable ignored) {
                         }
@@ -2176,6 +2188,34 @@ public class MainHook extends XposedModule {
             sWxVer = "?";
         }
         return sWxVer;
+    }
+
+    /**
+     * 同步拉取开关（关键时刻兜底，绕过 onResume 的限流与后台线程异步）。
+     * 根因：开关原本只在 onResume 经后台线程异步 cr.call 拉取；微信冷启动后模块立即注入，
+     * 但模块 App 的 ContentProvider 尚未就绪，前几次 cr.call 返回 null → cMomentsRaw 停在默认
+     * false，导致冷启动后第一次进朋友圈 SnsUploadUI 时漏注入 send_raw_img（发的不是原图）。
+     * 在 SnsUploadUI.onCreate 等关键时刻同步补拉一次，确保开关已就位。
+     * 仅在必要时调用（当前 cMomentsRaw 为 false 且确属朋友圈界面），避免主线程频繁 IPC。
+     */
+    private static void syncPullSwitches(Context ctx) {
+        if (ctx == null) return;
+        try {
+            ContentResolver cr = ctx.getContentResolver();
+            Bundle in = new Bundle();
+            in.putString(Const.K_LAST_ACT, sCurrentActivity);
+            in.putString(Const.K_WX_VER, wxVersion(ctx));
+            in.putString("proc", sProc);
+            Bundle out = cr.call(Uri.parse(Const.URI), Const.METHOD_REPORT, null, in);
+            if (out != null) {
+                cEnabled = out.getBoolean(Const.K_ENABLED, true);
+                cLive = out.getBoolean(Const.K_LIVE, true);
+                cOrig = out.getBoolean(Const.K_ORIG, true);
+                cLog = out.getBoolean(Const.K_LOG, false);
+                cMomentsRaw = out.getBoolean(Const.K_MOMENTS_RAW, false);
+            }
+        } catch (Throwable ignored) {
+        }
     }
 
     // ══════════════════════════ 工具 ══════════════════════════
