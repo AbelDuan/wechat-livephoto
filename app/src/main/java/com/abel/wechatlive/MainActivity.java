@@ -153,7 +153,7 @@ public class MainActivity extends Activity {
         cbLive = addCheck(box, Const.K_LIVE, true,
                 "默认开启「实况」");
         cbOrig = addCheck(box, Const.K_ORIG, true,
-                "聊天发图默认开启「原图」");
+                "默认开启「原图」");
         cbLog = addCheck(box, Const.K_LOG, false,
                 "日志记录");
 
@@ -196,7 +196,33 @@ public class MainActivity extends Activity {
         exportBtn.setPadding(dp(8), dp(10), dp(8), dp(10));
         topInner.addView(exportBtn, mw());
 
-        // 桌面图标（可隐藏，隐藏后用拨号暗码找回）
+        // 微信进程（功能开关下第一排）
+        TextView wxHead = new TextView(this);
+        wxHead.setText("微信进程");
+        wxHead.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        wxHead.setTypeface(Typeface.DEFAULT_BOLD);
+        wxHead.setTextColor(Color.parseColor("#222222"));
+        wxHead.setPadding(dp(4), dp(10), dp(4), dp(2));
+        topInner.addView(wxHead, mw());
+
+        LinearLayout wxBar = new LinearLayout(this);
+        wxBar.setOrientation(LinearLayout.HORIZONTAL);
+        wxBar.setPadding(0, dp(6), 0, dp(6));
+        wxBar.addView(btn("强制停止微信", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                forceStopWeChat();
+            }
+        }), eq());
+        wxBar.addView(btn("启动微信", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                startWeChat();
+            }
+        }), eq());
+        topInner.addView(wxBar, mw());
+
+        // 桌面图标（可隐藏，隐藏后用拨号暗码找回；功能开关下第二排）
         TextView iconHead = new TextView(this);
         iconHead.setText("桌面图标");
         iconHead.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
@@ -229,32 +255,6 @@ public class MainActivity extends Activity {
         iconBox.addView(iconHint, mw());
 
         topInner.addView(iconBox, mw());
-
-        // 微信进程控制
-        TextView wxHead = new TextView(this);
-        wxHead.setText("微信进程");
-        wxHead.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        wxHead.setTypeface(Typeface.DEFAULT_BOLD);
-        wxHead.setTextColor(Color.parseColor("#222222"));
-        wxHead.setPadding(dp(4), dp(10), dp(4), dp(2));
-        topInner.addView(wxHead, mw());
-
-        LinearLayout wxBar = new LinearLayout(this);
-        wxBar.setOrientation(LinearLayout.HORIZONTAL);
-        wxBar.setPadding(0, dp(6), 0, dp(6));
-        wxBar.addView(btn("强制停止微信", new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                forceStopWeChat();
-            }
-        }), eq());
-        wxBar.addView(btn("启动微信", new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                startWeChat();
-            }
-        }), eq());
-        topInner.addView(wxBar, mw());
 
         // 上方控制区占满剩余空间（weight=1），内容超高时自行滚动
         root.addView(top, new LinearLayout.LayoutParams(
