@@ -6,7 +6,6 @@ import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
-import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.graphics.Color;
 import android.graphics.Typeface;
@@ -59,7 +58,6 @@ public class MainActivity extends Activity {
     private TextView detailView;
     private TextView logView;
     private CheckBox cbEnabled, cbLive, cbOrig, cbLog;
-    private Button iconBtn;
 
     private final Handler ticker = new Handler(Looper.getMainLooper());
     private final Runnable tick = new Runnable() {
@@ -185,41 +183,7 @@ public class MainActivity extends Activity {
         }), eq());
         topInner.addView(wxBar, mw());
 
-        // 桌面图标（可隐藏，隐藏后用拨号暗码找回；功能开关下第二个功能块）
-        TextView iconHead = new TextView(this);
-        iconHead.setText("桌面图标");
-        iconHead.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        iconHead.setTypeface(Typeface.DEFAULT_BOLD);
-        iconHead.setTextColor(Color.parseColor("#222222"));
-        iconHead.setPadding(dp(4), dp(10), dp(4), dp(2));
-        topInner.addView(iconHead, mw());
-
-        LinearLayout iconBox = new LinearLayout(this);
-        iconBox.setOrientation(LinearLayout.VERTICAL);
-        iconBox.setBackgroundColor(Color.WHITE);
-        iconBox.setPadding(dp(10), dp(6), dp(10), dp(6));
-
-        iconBtn = btn("隐藏桌面图标", new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                toggleIcon();
-            }
-        });
-        iconBtn.setPadding(dp(8), dp(10), dp(8), dp(10));
-        iconBox.addView(iconBtn, mw());
-
-        TextView iconHint = new TextView(this);
-        iconHint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
-        iconHint.setTextColor(Color.parseColor("#888888"));
-        iconHint.setPadding(dp(2), dp(6), dp(2), dp(2));
-        iconHint.setText("隐藏后桌面不再显示本应用。找回方式：\n"
-                + "① 拨号盘输入 *#*#" + Const.SECRET_CODE + "#*#* 自动重新打开；\n"
-                + "② 或 adb：am start -n " + Const.MODULE_PKG + "/.MainActivity");
-        iconBox.addView(iconHint, mw());
-
-        topInner.addView(iconBox, mw());
-
-        // 操作按钮（功能开关下第三个功能块：刷新 / 复制日志 / 清空日志）
+        // 操作按钮（功能开关下第二个功能块：刷新 / 复制日志 / 清空日志）
         LinearLayout bar = new LinearLayout(this);
         bar.setOrientation(LinearLayout.HORIZONTAL);
         bar.setPadding(0, dp(10), 0, dp(6));
@@ -334,11 +298,6 @@ public class MainActivity extends Activity {
                 detailView.setText(detail(seen, age, hits, sp));
             }
 
-            if (iconBtn != null) {
-                iconBtn.setText(isIconHidden()
-                        ? "显示桌面图标（当前已隐藏）" : "隐藏桌面图标");
-            }
-
             List<String> lines = LogStore.tail(this, 400);
             if (lines.isEmpty()) {
                 logView.setText("（暂无日志）\n\n"
@@ -434,60 +393,6 @@ public class MainActivity extends Activity {
             toast("已导出到 " + out.getAbsolutePath());
         } catch (Throwable t) {
             toast("导出失败：" + t.getClass().getSimpleName());
-        }
-    }
-
-    // ── 桌面图标隐藏 / 恢复 ──
-    // 注意：CI 编译环境的 android.jar 偶发缺失 android.content.pm.ComponentName 符号
-    // （Xposed API 桩部分遮蔽了 android.content.pm 包）。用反射构造 ComponentName 并
-    // 调用 set/getComponentEnabledSetting，彻底绕开编译期符号依赖；运行时机型必然有该类。
-
-    private static final int ENABLED_STATE = 1;   // PackageManager.COMPONENT_ENABLED_STATE_ENABLED
-    private static final int DISABLED_STATE = 2;  // PackageManager.COMPONENT_ENABLED_STATE_DISABLED
-    private static final int DONT_KILL_APP = 1;   // PackageManager.DONT_KILL_APP
-
-    private Object launcherCn() {
-        try {
-            Class<?> cnClass = Class.forName("android.content.pm.ComponentName");
-            return cnClass.getConstructor(Context.class, String.class)
-                    .newInstance(this, Const.LAUNCHER_ALIAS);
-        } catch (Throwable t) {
-            return null;
-        }
-    }
-
-    private boolean isIconHidden() {
-        try {
-            Object cn = launcherCn();
-            if (cn == null) return sp().getBoolean(Const.K_ICON_HIDDEN, false);
-            Class<?> cnClass = Class.forName("android.content.pm.ComponentName");
-            Object state = getPackageManager().getClass()
-                    .getMethod("getComponentEnabledSetting", cnClass)
-                    .invoke(getPackageManager(), cn);
-            return DISABLED_STATE == ((Integer) state).intValue();
-        } catch (Throwable t) {
-            return sp().getBoolean(Const.K_ICON_HIDDEN, false);
-        }
-    }
-
-    private void toggleIcon() {
-        try {
-            Object cn = launcherCn();
-            if (cn == null) {
-                toast("组件名构造失败");
-                return;
-            }
-            boolean hidden = isIconHidden();
-            Class<?> cnClass = Class.forName("android.content.pm.ComponentName");
-            getPackageManager().getClass()
-                    .getMethod("setComponentEnabledSetting", cnClass, int.class, int.class)
-                    .invoke(getPackageManager(), cn,
-                            hidden ? ENABLED_STATE : DISABLED_STATE, DONT_KILL_APP);
-            sp().edit().putBoolean(Const.K_ICON_HIDDEN, !hidden).apply();
-            toast(hidden ? "桌面图标已恢复" : "桌面图标已隐藏（拨号 *#*#" + Const.SECRET_CODE + "#*#* 找回）");
-            render();
-        } catch (Throwable t) {
-            toast("操作失败：" + t.getClass().getSimpleName());
         }
     }
 

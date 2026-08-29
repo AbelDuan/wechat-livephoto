@@ -10,7 +10,6 @@ package com.abel.wechatlive;
  */
 public final class Const {
 
-    public static final String MODULE_PKG = "com.abel.wechatlive";
     public static final String WECHAT_PKG = "com.tencent.mm";
 
     /** 模块 App 暴露的状态通道（微信进程通过它回报状态、读取开关） */
@@ -45,13 +44,6 @@ public final class Const {
     public static final String K_WX_VER = "wx_ver";
     /** 状态：回报累计次数 */
     public static final String K_HITS = "hits";
-    /** 状态：桌面图标是否被隐藏 */
-    public static final String K_ICON_HIDDEN = "icon_hidden";
-
-    /** 桌面图标的 activity-alias 全名（隐藏/恢复图标用） */
-    public static final String LAUNCHER_ALIAS = "com.abel.wechatlive.LauncherEntry";
-    /** 隐藏图标后的恢复暗码（拨号盘输入 *#*#7356#*#*） */
-    public static final String SECRET_CODE = "7356";
 
     public static final String LOG_FILE = "hook.log";
     /** 日志文件超过此大小后截断保留后半段 */
