@@ -109,8 +109,9 @@ public class MainHook extends XposedModule {
     // 已 dump 过 View 树的 Activity，避免同一界面反复 dump（一次 600+ 行，会把关键日志淹没）
     private static final Set<String> sDumpedActs = new HashSet<String>();
     // 是否处于朋友圈发布流程（含其共用的 AlbumPreviewUI 相册选图）。
-    // 朋友圈/聊天共用相册界面，仅靠当前 Activity 类名无法分辨，故用此流程标记
-    // 在 desired()/noteChatRawOptOut() 中彻底屏蔽对朋友圈的强制干预。
+    // 朋友圈/聊天共用相册界面，仅靠当前 Activity 类名无法分辨，故用此流程标记。
+    // v8.20：朋友圈内强制原图发送（保留「启用原图」功能），但隐藏「原图」按钮
+    //        （避免与「制作视频」按钮重叠）；聊天相册的强制逻辑不受影响。
     private static volatile boolean sInMoments = false;
     // v8.6：用户在本次聊天选图流程中手动取消了「原图」。置位后本流程内不再强制该键，
     //      否则读取侧兜底会把用户的取消立刻改回勾选（v8.5 的 bug）。
@@ -162,7 +163,7 @@ public class MainHook extends XposedModule {
             sSelf = this;
             sProc = myProcName();
             log("========================================");
-            log("WechatLive v8.19 注入成功  proc=" + sProc);
+            log("WechatLive v8.20 注入成功  proc=" + sProc);
 
             // 相册只在主进程，重量级 hook 只装主进程，避免 :push/:appbrand 等无谓开销
             boolean main = Const.WECHAT_PKG.equals(sProc);
@@ -198,7 +199,13 @@ public class MainHook extends XposedModule {
     private static Boolean desired(String key) {
         if (key == null) return null;
         if (!cLive && !cOrig) return null;   // A: 原图/实况强制都关 → 直接放行，跳过字符串扫描
-        if (sInMoments) return null;         // 朋友圈流程：完全不干预，恢复微信原生行为（去除对朋友圈的影响）
+        // 朋友圈流程（v8.20）：强制原图发送 + 实况，保留「启用原图」功能；
+        // 但不强制显示原图按钮（按钮由 hideMomentsRawButton 隐藏，避免与「制作视频」重叠）。
+        if (sInMoments) {
+            if (cOrig && K_SEND_RAW.equals(key)) return Boolean.TRUE;
+            if (cLive && (K_LIVE_AUTO.equals(key) || K_LIVE_QUERY.equals(key))) return Boolean.TRUE;
+            return null;
+        }
         if (cLive) {
             if (K_LIVE_AUTO.equals(key)) return Boolean.TRUE;
             if (K_LIVE_QUERY.equals(key)) return Boolean.TRUE;
@@ -450,6 +457,10 @@ public class MainHook extends XposedModule {
         } else if (!looksLikeGallery(cls) && !cls.toLowerCase(Locale.US).contains("sns")) {
             sInMoments = false;
         }
+        // v8.20：朋友圈流程内隐藏「原图」按钮（避免与「制作视频」重叠）；原图发送由 desired() 强制开启。
+        if (sInMoments) {
+            hideMomentsRawButton(act);
+        }
 
         if (!cEnabled) return;
         log("onResume [" + sProc + "] " + cls);
@@ -593,6 +604,54 @@ public class MainHook extends XposedModule {
     private static boolean isMomentsPublisher(String cls) {
         if (cls == null) return false;
         return cls.toLowerCase(Locale.US).contains("snsupload");
+    }
+
+    /**
+     * v8.20：朋友圈流程内隐藏「原图」按钮，避免其与「制作视频」按钮重叠。
+     * 原图发送功能由 desired() 在 moment 流程强制开启（send_raw_img=true），
+     * 隐藏按钮只是去掉 UI，不影响实际以原图发送。仅在 sInMoments 时调用，聊天不受影响。
+     */
+    private static void hideMomentsRawButton(final Activity act) {
+        final Handler h = ui();
+        if (h == null) return;
+        // 延迟到布局完成后再遍历（onResume 时 DecorView 子树可能尚未就绪）
+        h.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    View root = act.getWindow().getDecorView();
+                    hideRawButtonRecursive(root);
+                } catch (Throwable t) {
+                    log("hideMomentsRawButton error: " + t);
+                }
+            }
+        }, 600);
+    }
+
+    /** 递归遍历 View 树，把「原图」按钮（contentDescription 或文本含「原图」）设为 GONE。 */
+    private static void hideRawButtonRecursive(View v) {
+        if (v == null || v.getVisibility() == View.GONE) return;
+        boolean isRaw = false;
+        CharSequence d = v.getContentDescription();
+        if (d != null) {
+            String ds = d.toString();
+            if ("原图".equals(ds) || ds.startsWith("原图")) isRaw = true;
+        }
+        if (!isRaw && v instanceof TextView) {
+            CharSequence t = ((TextView) v).getText();
+            if (t != null && t.toString().contains("原图")) isRaw = true;
+        }
+        if (isRaw) {
+            v.setVisibility(View.GONE);
+            log("★ 朋友圈：已隐藏「原图」按钮 " + v.getClass().getSimpleName());
+            return; // 该节点已处理，无需继续下钻
+        }
+        if (v instanceof ViewGroup) {
+            ViewGroup g = (ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) {
+                hideRawButtonRecursive(g.getChildAt(i));
+            }
+        }
     }
 
     // ══════════════════════ View 树 dump（诊断用）══════════════════════
