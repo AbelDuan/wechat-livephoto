@@ -108,9 +108,10 @@ public class MainHook extends XposedModule {
     private static final long FLUSH_INTERVAL_MS = 1200L;  // 普通日志的落盘节流间隔
     // 已 dump 过 View 树的 Activity，避免同一界面反复 dump（一次 600+ 行，会把关键日志淹没）
     private static final Set<String> sDumpedActs = new HashSet<String>();
-    // v8.4：进入相册前的来源界面。用于区分「朋友圈选图」与「聊天选图」——
-    //      两者共用 AlbumPreviewUI，仅靠当前 Activity 类名无法分辨。
-    private static volatile String sLastNonGallery = "";
+    // 是否处于朋友圈发布流程（含其共用的 AlbumPreviewUI 相册选图）。
+    // 朋友圈/聊天共用相册界面，仅靠当前 Activity 类名无法分辨，故用此流程标记
+    // 在 desired()/noteChatRawOptOut() 中彻底屏蔽对朋友圈的强制干预。
+    private static volatile boolean sInMoments = false;
     // v8.6：用户在本次聊天选图流程中手动取消了「原图」。置位后本流程内不再强制该键，
     //      否则读取侧兜底会把用户的取消立刻改回勾选（v8.5 的 bug）。
     private static volatile boolean sChatRawOptOut = false;
@@ -161,7 +162,7 @@ public class MainHook extends XposedModule {
             sSelf = this;
             sProc = myProcName();
             log("========================================");
-            log("WechatLive v8.18 注入成功  proc=" + sProc);
+            log("WechatLive v8.19 注入成功  proc=" + sProc);
 
             // 相册只在主进程，重量级 hook 只装主进程，避免 :push/:appbrand 等无谓开销
             boolean main = Const.WECHAT_PKG.equals(sProc);
@@ -196,14 +197,14 @@ public class MainHook extends XposedModule {
      */
     private static Boolean desired(String key) {
         if (key == null) return null;
+        if (!cLive && !cOrig) return null;   // A: 原图/实况强制都关 → 直接放行，跳过字符串扫描
+        if (sInMoments) return null;         // 朋友圈流程：完全不干预，恢复微信原生行为（去除对朋友圈的影响）
         if (cLive) {
             if (K_LIVE_AUTO.equals(key)) return Boolean.TRUE;
             if (K_LIVE_QUERY.equals(key)) return Boolean.TRUE;
         }
-        if (!cLive && !cOrig) return null;   // A: 原图/实况强制都关 → 直接放行，跳过字符串扫描
-        boolean moments = isMomentsPublisher(sCurrentActivity);
-        if (cOrig && !moments) {
-            // 「原图」按钮本身始终允许显示 —— 聊天流程要让用户能自己点。
+        if (cOrig) {
+            // 「原图」按钮本身在聊天流程始终允许显示 —— 聊天流程要让用户能自己点。
             if (K_SHOW_RAW_BTN.equals(key)) return Boolean.TRUE;
             if (K_SEND_RAW.equals(key)) {
                 // v8.6 关键修复：用户手动取消过就完全不干预。
@@ -231,8 +232,8 @@ public class MainHook extends XposedModule {
         if (!K_SEND_RAW.equals(key)) return false;
         if (!Boolean.FALSE.equals(val)) return false;
         if (sChatRawOptOut) return true;                 // 已取消过：后续一律放行
-        // 朋友圈流程按钮是隐藏的，用户点不到，不参与取消判定
-        if (isMomentsPublisher(sCurrentActivity) || fromMomentsFlow()) return false;
+        // 朋友圈流程完全不干预（含取消判定），避免影响朋友圈原生行为
+        if (sInMoments) return false;
         if (!looksLikeGallery(sCurrentActivity)) return false;
         long t0 = sGalleryEnterAt;
         if (t0 <= 0L || System.currentTimeMillis() - t0 < RAW_OPTOUT_GRACE_MS) return false;
@@ -442,13 +443,20 @@ public class MainHook extends XposedModule {
         final String cls = act.getClass().getName();
         sCurrentActivity = cls;   // 记录前台 Activity（供上下文感知强制使用）
 
+        // 朋友圈流程标记：进入 SnsUploadUI 置 true；离开到非 sns、非相册界面（聊天/桌面）置 false。
+        // 共用相册无法靠自身类名区分聊天/朋友圈，用此标记屏蔽对朋友圈的强制逻辑。
+        if (isMomentsPublisher(cls)) {
+            sInMoments = true;
+        } else if (!looksLikeGallery(cls) && !cls.toLowerCase(Locale.US).contains("sns")) {
+            sInMoments = false;
+        }
+
         if (!cEnabled) return;
         log("onResume [" + sProc + "] " + cls);
         boolean gallery = looksLikeGallery(cls);
         // v8.4：相册界面(AlbumPreviewUI)聊天与朋友圈共用，类名分不出来。
         //      记住进入相册「之前」停留的界面，用它判断本次选图属于哪条流程。
         if (!gallery) {
-            sLastNonGallery = cls;
             // v8.6：离开相册 = 本次选图流程结束。重置「用户取消原图」状态，
             //      下次进相册重新按「默认开启原图」处理。
             sChatRawOptOut = false;
@@ -586,17 +594,6 @@ public class MainHook extends XposedModule {
         if (cls == null) return false;
         return cls.toLowerCase(Locale.US).contains("snsupload");
     }
-
-    // ══════════════════════ 微信 UI 修复（重叠）══════════════════════
-
-    /** 本次相册选图是否来自朋友圈流程（相册界面聊天/朋友圈共用，只能靠来源界面区分） */
-    private static boolean fromMomentsFlow() {
-        String s = sLastNonGallery;
-        if (s == null) return false;
-        String l = s.toLowerCase(Locale.US);
-        return l.contains("plugin.sns") || l.contains("sns.ui");
-    }
-
 
     // ══════════════════════ View 树 dump（诊断用）══════════════════════
 
