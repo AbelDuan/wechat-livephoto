@@ -114,6 +114,11 @@ public class MainHook extends XposedModule {
     //        （避免与「制作视频」按钮重叠）；聊天相册的强制逻辑不受影响（仅默认启用
     //        微信自带的原图按钮，不新增任何按钮）。
     private static volatile boolean sInMoments = false;
+    // v8.22：朋友圈发布页的界面特征文案。命中任意一个即判定为朋友圈发布流程。
+    //        —— 不再依赖 Activity 类名（微信改名/混淆会让类名为 false，导致隐藏逻辑从不执行）。
+    private static final String[] MOMENTS_MARKERS = {"制作视频", "谁可以看", "提醒谁看", "所在位置"};
+    // v8.22：当前屏幕是否为朋友圈发布页（由界面特征判定，供隐藏 / setVisibility 拦截使用）
+    private static volatile boolean sMomentsScreen = false;
     // v8.6：用户在本次聊天选图流程中手动取消了「原图」。置位后本流程内不再强制该键，
     //      否则读取侧兜底会把用户的取消立刻改回勾选（v8.5 的 bug）。
     private static volatile boolean sChatRawOptOut = false;
@@ -164,7 +169,7 @@ public class MainHook extends XposedModule {
             sSelf = this;
             sProc = myProcName();
             log("========================================");
-            log("WechatLive v8.21 注入成功  proc=" + sProc);
+            log("WechatLive v8.22 注入成功  proc=" + sProc);
 
             // 相册只在主进程，重量级 hook 只装主进程，避免 :push/:appbrand 等无谓开销
             boolean main = Const.WECHAT_PKG.equals(sProc);
@@ -202,12 +207,12 @@ public class MainHook extends XposedModule {
         if (key == null) return null;
         if (!cLive && !cOrig) return null;   // A: 原图/实况强制都关 → 直接放行，跳过字符串扫描
         // 朋友圈流程（v8.20）：强制原图发送 + 实况，保留「启用原图」功能；
-        // 但不强制显示原图按钮（按钮由 hideMomentsRawButton 隐藏，避免与「制作视频」重叠）。
+        // 但不强制显示原图按钮（按钮由 hideRawMarkerOnMomentsScreen 隐藏，避免与「制作视频」重叠）。
         if (sInMoments) {
             // 保留原图发送功能（数据层强制以原图发送）
             if (cOrig && K_SEND_RAW.equals(key)) return Boolean.TRUE;
             // v8.21：朋友圈一律不显示「原图」按钮/标志 —— 从数据层就让微信别把它渲染出来，
-            //        避免其显示后与「制作视频」按钮重叠（UI 层 hideMomentsRawButton 为兜底）。
+            //        避免其显示后与「制作视频」按钮重叠（UI 层 hideRawMarkerOnMomentsScreen 为兜底）。
             if (K_SHOW_RAW_BTN.equals(key)) return Boolean.FALSE;
             if (cLive && (K_LIVE_AUTO.equals(key) || K_LIVE_QUERY.equals(key))) return Boolean.TRUE;
             return null;
@@ -463,10 +468,9 @@ public class MainHook extends XposedModule {
         } else if (!looksLikeGallery(cls) && !cls.toLowerCase(Locale.US).contains("sns")) {
             sInMoments = false;
         }
-        // v8.20：朋友圈流程内隐藏「原图」按钮（避免与「制作视频」重叠）；原图发送由 desired() 强制开启。
-        if (sInMoments) {
-            hideMomentsRawButton(act);
-        }
+        // v8.22：不依赖类名，按界面特征判定朋友圈发布页并隐藏「原图」标志（避免与「制作视频」重叠）。
+        //        聊天侧不命中朋友圈特征，其自带原图按钮不受影响。
+        hideRawMarkerOnMomentsScreen(act);
 
         if (!cEnabled) return;
         log("onResume [" + sProc + "] " + cls);
@@ -606,10 +610,14 @@ public class MainHook extends XposedModule {
                 || l.contains("snsupload");
     }
 
-    /** 朋友圈发布界面（com.tencent.mm.plugin.sns.ui.SnsUploadUI 等） */
+    /**
+     * 朋友圈发布界面。v8.22：放宽匹配 —— 除 snsupload 外，plugin.sns / sns.ui 也算，
+     * 降低微信改名/混淆导致判定失效的概率（UI 隐藏另有不依赖类名的界面特征兜底）。
+     */
     private static boolean isMomentsPublisher(String cls) {
         if (cls == null) return false;
-        return cls.toLowerCase(Locale.US).contains("snsupload");
+        String l = cls.toLowerCase(Locale.US);
+        return l.contains("snsupload") || l.contains("plugin.sns") || l.contains("sns.ui");
     }
 
     /**
@@ -617,18 +625,37 @@ public class MainHook extends XposedModule {
      * 原图发送功能由 desired() 在 moment 流程强制开启（send_raw_img=true），
      * 隐藏按钮只是去掉 UI，不影响实际以原图发送。仅在 sInMoments 时调用，聊天不受影响。
      */
-    private static void hideMomentsRawButton(final Activity act) {
+    /**
+     * v8.22：隐藏朋友圈发布页的「原图」标志。
+     *
+     * 关键改进：**不再依赖 Activity 类名判定朋友圈**。v8.20/v8.21 用类名含 snsupload
+     * 来识别朋友圈，一旦微信改名或混淆，sInMoments 永远为 false，隐藏逻辑一次都不会执行
+     * —— 这正是「装了新版但原图按钮照旧」的根因。
+     * 改为界面特征判定：朋友圈发布页必然出现「制作视频 / 谁可以看 / 提醒谁看 / 所在位置」
+     * 之类文案，只要同屏命中，就隐藏同屏的「原图」标志。与原图按钮重叠的正是「制作视频」。
+     */
+    private static void hideRawMarkerOnMomentsScreen(final Activity act) {
         final Handler h = ui();
         if (h == null) return;
         final View root = act.getWindow().getDecorView();
-        // v8.21：扫两遍。第一遍覆盖常规布局，第二遍兜住异步/延迟创建的按钮。
         Runnable scan = new Runnable() {
             @Override
             public void run() {
                 try {
-                    if (sInMoments) hideRawButtonRecursive(root);
+                    MomentsScan r = new MomentsScan();
+                    scanForRawAndMoments(root, r);
+                    sMomentsScreen = r.moments;   // 供 View#setVisibility 拦截使用
+                    if (!r.moments) return;       // 不是朋友圈发布页：不动聊天侧的任何按钮
+                    if (r.rawViews.isEmpty()) {
+                        log("朋友圈发布页：未匹配到「原图」View（可能需要调整匹配规则）");
+                        return;
+                    }
+                    for (View v : r.rawViews) {
+                        v.setVisibility(View.GONE);
+                    }
+                    log("★ 朋友圈：已隐藏「原图」标志 x" + r.rawViews.size());
                 } catch (Throwable t) {
-                    log("hideMomentsRawButton error: " + t);
+                    log("hideRawMarkerOnMomentsScreen error: " + t);
                 }
             }
         };
@@ -636,27 +663,34 @@ public class MainHook extends XposedModule {
         h.postDelayed(scan, 2000);
     }
 
-    /** 递归遍历 View 树，把「原图」按钮（contentDescription 或文本含「原图」）设为 GONE。 */
-    private static void hideRawButtonRecursive(View v) {
-        if (v == null || v.getVisibility() == View.GONE) return;
-        boolean isRaw = false;
+    /** 扫描 View 树：收集「原图」View，并判断本屏是否为朋友圈发布页。 */
+    private static void scanForRawAndMoments(View v, MomentsScan out) {
+        if (v == null) return;
         CharSequence d = v.getContentDescription();
-        if (d != null && d.toString().contains("原图")) isRaw = true;   // v8.21：改成 contains，兼容「原图 未选中」等带状态的 desc
-        if (!isRaw && v instanceof TextView) {
+        boolean isRaw = (d != null && d.toString().contains("原图"));
+        if (v instanceof TextView) {
             CharSequence t = ((TextView) v).getText();
-            if (t != null && t.toString().contains("原图")) isRaw = true;
+            String ts = (t == null) ? null : t.toString();
+            if (ts != null) {
+                if (ts.contains("原图")) isRaw = true;
+                for (int i = 0; i < MOMENTS_MARKERS.length; i++) {
+                    if (ts.contains(MOMENTS_MARKERS[i])) out.moments = true;
+                }
+            }
         }
-        if (isRaw) {
-            v.setVisibility(View.GONE);
-            log("★ 朋友圈：已隐藏「原图」标志 " + v.getClass().getSimpleName());
-            return; // 该节点已处理，无需继续下钻
-        }
+        if (isRaw) out.rawViews.add(v);
         if (v instanceof ViewGroup) {
             ViewGroup g = (ViewGroup) v;
             for (int i = 0; i < g.getChildCount(); i++) {
-                hideRawButtonRecursive(g.getChildAt(i));
+                scanForRawAndMoments(g.getChildAt(i), out);
             }
         }
+    }
+
+    /** 扫描结果容器 */
+    private static final class MomentsScan {
+        final List<View> rawViews = new ArrayList<View>();
+        boolean moments = false;
     }
 
     /**
@@ -669,7 +703,7 @@ public class MainHook extends XposedModule {
             hook(m).intercept(new XposedInterface.Hooker() {
                 @Override
                 public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                    if (sInMoments) {
+                    if (sMomentsScreen) {
                         try {
                             int vis = (Integer) chain.getArgs().get(0);
                             if (vis != View.GONE) {
