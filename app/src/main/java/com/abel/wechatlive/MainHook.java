@@ -1,7 +1,6 @@
 package com.abel.wechatlive;
 
 import android.app.Activity;
-import android.content.ComponentName;
 import android.content.ContentResolver;
 import android.content.Context;
 import android.content.Intent;
@@ -169,7 +168,7 @@ public class MainHook extends XposedModule {
             sSelf = this;
             sProc = myProcName();
             log("========================================");
-            log("WechatLive v8.25 注入成功  proc=" + sProc);
+            log("WechatLive v8.24 注入成功  proc=" + sProc);
 
             // 相册只在主进程，重量级 hook 只装主进程，避免 :push/:appbrand 等无谓开销
             boolean main = Const.WECHAT_PKG.equals(sProc);
@@ -180,7 +179,6 @@ public class MainHook extends XposedModule {
 
             installExtraForcing();
             installLifecycle();
-            installMomentsRawIntent();   // v8.25：朋友圈原图（参考 WAuxiliary，在启动相册的 Intent 上注入 send_raw_img）
         } catch (Throwable t) {
             log("onPackageReady 异常: " + t);
         }
@@ -446,69 +444,6 @@ public class MainHook extends XposedModule {
 
 
 
-
-    /**
-     * v8.25：朋友圈原图（参考 HdShare/WAuxiliary_Public 的 AutoSelectOriginalPhotoHook）。
-     *
-     * 根因修复：朋友圈与聊天共用相册 AlbumPreviewUI / ImagePreviewUI。之前的 v8.24 只在
-     * desired() 里「当 sInMoments 为真时强制 send_raw_img=true」，但 sInMoments 是针对
-     * 当前「前台 Activity」的标记 —— 一旦进入共用的相册，前台就是 AlbumPreviewUI，
-     * 它既不是朋友圈发布页、也没有「制作视频」等特征文案，于是 sInMoments 变为 false，
-     * 那段强制逻辑一次都不会执行（等于死代码）。这就是「勾了朋友圈原图却没效果」的原因。
-     *
-     * WAuxiliary 的做法更可靠：在「朋友圈发布页启动相册」的那一刻（此时 Activity 还是
-     * SnsUploadUI，sInMoments 仍为真）拦截 startActivity，直接往启动相册的 Intent 上
-     * putExtra("send_raw_img", true)。相册据此以「原图」初始化，发图/发视频均按原图上传。
-     * 该键对图片和视频同时生效，且完全不新增任何 UI。
-     */
-    private void installMomentsRawIntent() {
-        try {
-            final Method m = findMethod(Activity.class, "startActivity", Intent.class);
-            hook(m).intercept(new XposedInterface.Hooker() {
-                @Override
-                public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                    if (cEnabled && cMomentsOrig && sInMoments) {
-                        try {
-                            Object arg = chain.getArgs().get(0);
-                            if (arg instanceof Intent) injectRawIntoGallery((Intent) arg);
-                        } catch (Throwable ignored) { }
-                    }
-                    return chain.proceed();
-                }
-            });
-            try {
-                final Method m2 = findMethod(Activity.class, "startActivityForResult", Intent.class, int.class);
-                hook(m2).intercept(new XposedInterface.Hooker() {
-                    @Override
-                    public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                        if (cEnabled && cMomentsOrig && sInMoments) {
-                            try {
-                                Object arg = chain.getArgs().get(0);
-                                if (arg instanceof Intent) injectRawIntoGallery((Intent) arg);
-                            } catch (Throwable ignored) { }
-                        }
-                        return chain.proceed();
-                    }
-                });
-            } catch (Throwable ignored) { }
-            log("已挂载 Activity#startActivity（朋友圈原图注入）");
-        } catch (Throwable t) {
-            log("挂载 startActivity 失败: " + t);
-        }
-    }
-
-    /** 朋友圈发布页启动相册时，在 Intent 上注入 send_raw_img=true（仅对共享相册类生效）。 */
-    private static void injectRawIntoGallery(Intent intent) {
-        ComponentName cn = intent.getComponent();
-        String cls = (cn != null) ? cn.getClassName() : null;
-        if (cls == null) return;
-        if (cls.equals("com.tencent.mm.plugin.gallery.ui.AlbumPreviewUI")
-                || cls.equals("com.tencent.mm.plugin.gallery.ui.ImagePreviewUI")
-                || cls.endsWith(".AlbumPreviewUI") || cls.endsWith(".ImagePreviewUI")) {
-            intent.putExtra(K_SEND_RAW, true);
-            log("★ 朋友圈原图：相册启动 Intent 注入 send_raw_img=true (" + cls + ")");
-        }
-    }
 
     private static void onResume(final Activity act) {
         if (act == null) return;
