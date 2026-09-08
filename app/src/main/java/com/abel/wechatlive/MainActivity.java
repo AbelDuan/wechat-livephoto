@@ -152,8 +152,6 @@ public class MainActivity extends Activity {
                 "开启「实况」");
         cbOrig = addCheck(box, Const.K_ORIG, true,
                 "开启「原图」");
-        addCheck(box, Const.K_MOMENTS_ORIG, false,
-                "朋友圈「原图」（发图/发视频均按原图上传）");
         cbLog = addCheck(box, Const.K_LOG, false,
                 "日志记录");
 
