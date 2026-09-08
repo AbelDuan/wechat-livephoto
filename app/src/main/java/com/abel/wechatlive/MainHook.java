@@ -19,7 +19,6 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.RandomAccessFile;
-import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
@@ -116,7 +115,7 @@ public class MainHook extends XposedModule {
     private static volatile boolean sInMoments = false;
     // v8.22：朋友圈发布页的界面特征文案。命中任意一个即判定为朋友圈发布流程。
     //        —— 不再依赖 Activity 类名（微信改名/混淆会让类名为 false，导致隐藏逻辑从不执行）。
-    private static final String[] MOMENTS_MARKERS = {"制作视频", "谁可以看", "提醒谁看", "所在位置"};
+    private static final String[] MOMENTS_MARKERS = {"制作视频", "谁可以看", "提醒谁看"};
     // v8.22：当前屏幕是否为朋友圈发布页（由界面特征判定，供隐藏 / setVisibility 拦截使用）
     private static volatile boolean sMomentsScreen = false;
     // v8.6：用户在本次聊天选图流程中手动取消了「原图」。置位后本流程内不再强制该键，
@@ -440,15 +439,6 @@ public class MainHook extends XposedModule {
         }
     }
 
-    /**
-     * 朋友圈原图探测（诊断用，仅「朋友圈上传原图」开启时生效，默认零开销）：
-     * 微信发朋友圈时会对大图做压缩再上传，真正的画质入口在压缩/编码阶段，
-     * 不在 Intent extras（日志已实锤 SnsUploadUI 的 extras 无原图键）。
-     * 这里 hook Bitmap.compress，当「面积较大（上传级）且调用栈来自 plugin.sns」时，
-     * 打印完整调用栈——下一次开启「朋友圈上传原图」、进朋友圈点发送后导出的日志里，
-     * 就能看到微信压缩图片的具体类名/方法，据此实现「复制法/转换法」真正绕过压缩。
-     * 该 hook 只读、不改，且带面积阈值 + 次数上限，开关关闭时零开销。
-     */
 
 
 
@@ -590,18 +580,6 @@ public class MainHook extends XposedModule {
         });
     }
 
-    /**
-     * v8.1 路径缩写：微信临时文件路径长达 150+ 字符，其中 100 字符是固定前缀。
-     * 只保留「draft 目录名/文件名」，日志可读性大幅提升。
-     */
-    private static String shortPath(String path) {
-        if (path == null) return "null";
-        int i = path.indexOf("/draft/");
-        if (i >= 0) return "…/draft/" + path.substring(i + 7);
-        i = path.lastIndexOf('/');
-        return i >= 0 ? "…/" + path.substring(i + 1) : path;
-    }
-
     private static boolean looksLikeGallery(String cls) {
         if (cls == null) return false;
         String l = cls.toLowerCase(Locale.US);
@@ -620,11 +598,6 @@ public class MainHook extends XposedModule {
         return l.contains("snsupload") || l.contains("plugin.sns") || l.contains("sns.ui");
     }
 
-    /**
-     * v8.20：朋友圈流程内隐藏「原图」按钮，避免其与「制作视频」按钮重叠。
-     * 原图发送功能由 desired() 在 moment 流程强制开启（send_raw_img=true），
-     * 隐藏按钮只是去掉 UI，不影响实际以原图发送。仅在 sInMoments 时调用，聊天不受影响。
-     */
     /**
      * v8.22：隐藏朋友圈发布页的「原图」标志。
      *
@@ -666,19 +639,16 @@ public class MainHook extends XposedModule {
     /** 扫描 View 树：收集「原图」View，并判断本屏是否为朋友圈发布页。 */
     private static void scanForRawAndMoments(View v, MomentsScan out) {
         if (v == null) return;
-        CharSequence d = v.getContentDescription();
-        boolean isRaw = (d != null && d.toString().contains("原图"));
+        if (isRawMarkerView(v)) out.rawViews.add(v);
         if (v instanceof TextView) {
             CharSequence t = ((TextView) v).getText();
             String ts = (t == null) ? null : t.toString();
             if (ts != null) {
-                if (ts.contains("原图")) isRaw = true;
                 for (int i = 0; i < MOMENTS_MARKERS.length; i++) {
                     if (ts.contains(MOMENTS_MARKERS[i])) out.moments = true;
                 }
             }
         }
-        if (isRaw) out.rawViews.add(v);
         if (v instanceof ViewGroup) {
             ViewGroup g = (ViewGroup) v;
             for (int i = 0; i < g.getChildCount(); i++) {
@@ -691,6 +661,18 @@ public class MainHook extends XposedModule {
     private static final class MomentsScan {
         final List<View> rawViews = new ArrayList<View>();
         boolean moments = false;
+    }
+
+    /** 「原图」标志判定：contentDescription 或 TextView 文本包含「原图」（扫描与拦截共用同一份规则）。 */
+    private static boolean isRawMarkerView(View v) {
+        if (v == null) return false;
+        CharSequence d = v.getContentDescription();
+        if (d != null && d.toString().contains("原图")) return true;
+        if (v instanceof TextView) {
+            CharSequence t = ((TextView) v).getText();
+            if (t != null && t.toString().contains("原图")) return true;
+        }
+        return false;
     }
 
     /**
@@ -706,20 +688,11 @@ public class MainHook extends XposedModule {
                     if (sMomentsScreen) {
                         try {
                             int vis = (Integer) chain.getArgs().get(0);
-                            if (vis != View.GONE) {
-                                View v = (View) chain.getThisObject();
-                                CharSequence d = v.getContentDescription();
-                                boolean isRaw = (d != null && d.toString().contains("原图"));
-                                if (!isRaw && v instanceof TextView) {
-                                    CharSequence t = ((TextView) v).getText();
-                                    isRaw = (t != null && t.toString().contains("原图"));
-                                }
-                                if (isRaw) {
-                                    Object[] a = chain.getArgs().toArray();
-                                    a[0] = Integer.valueOf(View.GONE);
-                                    log("★ 朋友圈：拦截「原图」标志显示 -> GONE");
-                                    return chain.proceed(a);
-                                }
+                            if (vis != View.GONE && isRawMarkerView((View) chain.getThisObject())) {
+                                Object[] a = chain.getArgs().toArray();
+                                a[0] = Integer.valueOf(View.GONE);
+                                log("★ 朋友圈：拦截「原图」标志显示 -> GONE");
+                                return chain.proceed(a);
                             }
                         } catch (Throwable ignored) {
                         }
@@ -840,18 +813,6 @@ public class MainHook extends XposedModule {
             Method m = cls.getDeclaredMethod(name, pts);
             m.setAccessible(true);
             return m;
-        }
-    }
-
-    /** 反射找构造器（先公共后声明）。调用方必须处于 try/catch(Throwable) 内。 */
-    private static Constructor<?> findCtor(Class<?> cls, Class<?>... pts)
-            throws NoSuchMethodException {
-        try {
-            return cls.getConstructor(pts);
-        } catch (NoSuchMethodException e) {
-            Constructor<?> c = cls.getDeclaredConstructor(pts);
-            c.setAccessible(true);
-            return c;
         }
     }
 
