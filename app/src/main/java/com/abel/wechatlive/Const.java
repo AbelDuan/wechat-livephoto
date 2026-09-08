@@ -31,6 +31,11 @@ public final class Const {
     public static final String K_LIVE = "auto_live";
     /** 用户开关：自动勾选「原图」 */
     public static final String K_ORIG = "auto_orig";
+    /**
+     * 用户开关：朋友圈原图（v8.24）。开启后朋友圈发图/发视频强制以原图上传。
+     * 默认关闭 —— 朋友圈与聊天共用相册界面，属于「聊天原图」之外的独立开关，需用户显式勾选。
+     */
+    public static final String K_MOMENTS_ORIG = "moments_orig";
     /** 用户开关：详细日志（v8.9 起设置页已移除该开关；保留常量仅为 StatusProvider 兼容历史数据） */
     public static final String K_VERBOSE = "verbose";
     /** 用户开关：日志记录（写入 App 私有文件，排障/导出用，默认关闭省电） */

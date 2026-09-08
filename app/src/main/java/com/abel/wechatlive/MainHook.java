@@ -140,6 +140,9 @@ public class MainHook extends XposedModule {
     private static volatile boolean cEnabled = true;
     private static volatile boolean cLive = true;
     private static volatile boolean cOrig = true;
+    // v8.24：朋友圈原图（默认关）。开启后朋友圈发图/发视频强制 send_raw_img=true。
+    //        只改数据、不碰 UI：不强制 key_force_show_raw_image_button，也不向微信注入任何 View。
+    private static volatile boolean cMomentsOrig = false;
     // 详细日志(导出 View 树)默认关闭——v8.9 起「详细日志」开关已从设置页移除，
     // 恒为 false（功能下线；下方 cVerbose 分支全部不再触发，保留为死代码避免大改）
     private static volatile boolean cVerbose = false;
@@ -165,7 +168,7 @@ public class MainHook extends XposedModule {
             sSelf = this;
             sProc = myProcName();
             log("========================================");
-            log("WechatLive v8.23 注入成功  proc=" + sProc);
+            log("WechatLive v8.24 注入成功  proc=" + sProc);
 
             // 相册只在主进程，重量级 hook 只装主进程，避免 :push/:appbrand 等无谓开销
             boolean main = Const.WECHAT_PKG.equals(sProc);
@@ -200,10 +203,18 @@ public class MainHook extends XposedModule {
      */
     private static Boolean desired(String key) {
         if (key == null) return null;
-        if (!cLive && !cOrig) return null;   // A: 原图/实况强制都关 → 直接放行，跳过字符串扫描
-        // 朋友圈流程（v8.23）：完全不干预 —— 朋友圈原图功能已取消，恢复微信原生行为。
-        // 聊天与朋友圈共用相册界面，必须靠 sInMoments 挡住，否则聊天的强制会漏进朋友圈。
-        if (sInMoments) return null;
+        // A: 实况 / 聊天原图 / 朋友圈原图三者都关 → 直接放行，跳过字符串扫描
+        if (!cLive && !cOrig && !cMomentsOrig) return null;
+        // 朋友圈流程：默认完全不干预（恢复微信原生行为）。聊天与朋友圈共用相册界面，
+        // 必须靠 sInMoments 挡住，否则聊天的强制会漏进朋友圈。
+        if (sInMoments) {
+            // v8.24：朋友圈原图（开关控制，默认关）。与 WAuxiliary 的 AutoSelectOriginalPhotoHook
+            //        同一思路 —— 朋友圈走的是共享相册 AlbumPreviewUI / ImagePreviewUI，
+            //        把 send_raw_img 置 true 即可；该键对图片和视频同时生效。
+            //        只改数据不碰 UI：不强制 key_force_show_raw_image_button，也不注入任何 View。
+            if (cMomentsOrig && K_SEND_RAW.equals(key)) return Boolean.TRUE;
+            return null;
+        }
         if (cLive) {
             if (K_LIVE_AUTO.equals(key)) return Boolean.TRUE;
             if (K_LIVE_QUERY.equals(key)) return Boolean.TRUE;
@@ -700,6 +711,7 @@ public class MainHook extends XposedModule {
                         cEnabled = out.getBoolean(Const.K_ENABLED, true);
                         cLive = out.getBoolean(Const.K_LIVE, true);
                         cOrig = out.getBoolean(Const.K_ORIG, true);
+                        cMomentsOrig = out.getBoolean(Const.K_MOMENTS_ORIG, false);
                         // v8.9：详细日志开关已移除，cVerbose 恒为 false，不再从 App 读取
                         cLog = out.getBoolean(Const.K_LOG, false);
                     }
